@@ -1,160 +1,129 @@
-using System.Diagnostics;
-using System.Reflection;
 using System.Runtime.InteropServices;
-using PDFtoImage;
-using Sdcb.SimdPaddleOCR;
-using Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.PixelFormats;
-using SkiaSharp;
+using MiniOcr;
+using MiniOcr.Models;
+using MiniOcr.Services;
 
-static string ResolvePdfPath(string[] args)
+WebApplicationBuilder builder = WebApplication.CreateSlimBuilder(args);
+
+builder.Services.ConfigureHttpJsonOptions(options =>
 {
-    if (args.Length > 0 && !string.IsNullOrWhiteSpace(args[0]))
-    {
-        string path = Path.GetFullPath(args[0]);
-        if (!File.Exists(path))
-            throw new FileNotFoundException($"PDF not found: {path}");
-        return path;
-    }
+    options.SerializerOptions.TypeInfoResolverChain.Insert(0, AppJsonContext.Default);
+});
 
-    string? embedded = ExtractEmbeddedSample();
-    if (embedded is not null)
-        return embedded;
-
-    string fallback = Path.Combine(AppContext.BaseDirectory, "samples", "sample-multipage.pdf");
-    if (File.Exists(fallback))
-        return fallback;
-
-    throw new FileNotFoundException("No PDF argument and embedded sample not found.");
-}
-
-static string? ExtractEmbeddedSample()
+builder.Services.AddHttpClient<ParallelPdfDownloader>(client =>
 {
-    Assembly asm = Assembly.GetExecutingAssembly();
-    const string resourceName = "MiniOcr.samples.sample-multipage.pdf";
-    using Stream? stream = asm.GetManifestResourceStream(resourceName);
-    if (stream is null)
-        return null;
+    client.Timeout = TimeSpan.FromMinutes(10);
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("MiniOcr/1.0 (+https://github.com/huiyuanai709/miniocr)");
+    client.MaxResponseContentBufferSize = 16 * 1024 * 1024;
+});
 
-    string temp = Path.Combine(Path.GetTempPath(), "miniocr-sample-multipage.pdf");
-    using (FileStream fs = File.Create(temp))
-        stream.CopyTo(fs);
-    return temp;
-}
-
-static Configuration ContiguousConfig()
+using ILoggerFactory bootstrapLogs = LoggerFactory.Create(logging =>
 {
-    Configuration config = Configuration.Default.Clone();
-    config.PreferContiguousImageBuffers = true;
-    return config;
-}
+    logging.AddConsole();
+    logging.SetMinimumLevel(LogLevel.Information);
+});
 
-static Image<Rgba32> SkBitmapToRgba32(SKBitmap bitmap)
-{
-    using SKBitmap copy = bitmap.Copy(SKColorType.Rgba8888)
-        ?? throw new InvalidOperationException("Failed to convert SKBitmap to RGBA8888.");
-
-    Image<Rgba32> image = new(ContiguousConfig(), copy.Width, copy.Height);
-    if (!image.DangerousTryGetSinglePixelMemory(out Memory<Rgba32> memory))
-    {
-        // Fallback: allocate contiguous managed buffer and wrap via LoadPixelData path
-        Rgba32[] buffer = GC.AllocateUninitializedArray<Rgba32>(copy.Width * copy.Height);
-        Span<byte> dest = MemoryMarshal.AsBytes(buffer.AsSpan());
-        IntPtr pixels = copy.GetPixels();
-        unsafe
-        {
-            new ReadOnlySpan<byte>((void*)pixels, copy.ByteCount).CopyTo(dest);
-        }
-        image.Dispose();
-        image = Image.LoadPixelData<Rgba32>(ContiguousConfig(), buffer, copy.Width, copy.Height);
-        if (!image.DangerousTryGetSinglePixelMemory(out _))
-            throw new InvalidDataException("ImageSharp pixels are not contiguous after fallback.");
-        return image;
-    }
-
-    Span<byte> destBytes = MemoryMarshal.AsBytes(memory.Span);
-    IntPtr srcPixels = copy.GetPixels();
-    unsafe
-    {
-        new ReadOnlySpan<byte>((void*)srcPixels, copy.ByteCount).CopyTo(destBytes);
-    }
-    return image;
-}
-
-string pdfPath = ResolvePdfPath(args);
-Console.WriteLine($"PDF: {pdfPath}");
 Console.WriteLine($"Runtime: {RuntimeInformation.FrameworkDescription}");
 Console.WriteLine($"OS: {RuntimeInformation.OSDescription} ({RuntimeInformation.OSArchitecture})");
-Console.WriteLine();
+Console.WriteLine("Loading ChineseV6Tiny OCR models...");
 
-byte[] pdfBytes = await File.ReadAllBytesAsync(pdfPath);
-int pageCount = Conversion.GetPageCount(pdfBytes);
-Console.WriteLine($"Pages: {pageCount}");
+OcrEngine engine = await OcrEngine.CreateAsync(bootstrapLogs.CreateLogger<OcrEngine>());
+builder.Services.AddSingleton(engine);
+builder.Services.AddSingleton<PdfOcrPipeline>();
 
-RenderOptions renderOptions = new(Dpi: 150);
+WebApplication app = builder.Build();
+ILogger logger = app.Logger;
 
-Console.WriteLine("Loading ChineseV6Tiny models...");
-Stopwatch loadSw = Stopwatch.StartNew();
-using PaddleOcrAll ocr = await PaddleOcrAll.LoadAsync(ChineseV6TinyModels.Default);
-loadSw.Stop();
-double modelLoadMs = loadSw.Elapsed.TotalMilliseconds;
-Console.WriteLine($"Model load: {modelLoadMs:F1} ms");
-Console.WriteLine();
-
-double totalRasterizeMs = 0;
-double totalOcrMs = 0;
-var pageOcrMs = new List<double>(pageCount);
-
-for (int i = 0; i < pageCount; i++)
+IHostApplicationLifetime lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
+lifetime.ApplicationStopping.Register(() =>
 {
-    Stopwatch rasterSw = Stopwatch.StartNew();
-    using SKBitmap skBitmap = Conversion.ToImage(pdfBytes, i, options: renderOptions);
-    using Image<Rgba32> image = SkBitmapToRgba32(skBitmap);
-    rasterSw.Stop();
-    double rasterMs = rasterSw.Elapsed.TotalMilliseconds;
-    totalRasterizeMs += rasterMs;
+    engine.DisposeAsync().AsTask().GetAwaiter().GetResult();
+});
 
-    if (!image.DangerousTryGetSinglePixelMemory(out Memory<Rgba32> memory))
-        throw new InvalidDataException($"Page {i + 1}: pixels are not contiguous.");
+app.MapGet("/health", (OcrEngine ocr) => Results.Json(
+    new HealthResponse
+    {
+        Status = "ok",
+        ModelsLoaded = ocr.IsLoaded,
+        Runtime = RuntimeInformation.FrameworkDescription,
+        ProcessorCount = Environment.ProcessorCount,
+    },
+    AppJsonContext.Default.HealthResponse));
 
-    Stopwatch ocrSw = Stopwatch.StartNew();
-    PaddleOcrResult result = ocr.Run(
-        MemoryMarshal.AsBytes(memory.Span),
-        image.Width,
-        image.Height,
-        format: ImagePixelFormat.Rgba32);
-    ocrSw.Stop();
-    double ocrMs = ocrSw.Elapsed.TotalMilliseconds;
-    totalOcrMs += ocrMs;
-    pageOcrMs.Add(ocrMs);
+app.MapPost("/ocr", async Task<IResult> (
+    HttpRequest httpRequest,
+    ParallelPdfDownloader downloader,
+    PdfOcrPipeline pipeline,
+    CancellationToken ct) =>
+{
+    OcrUrlRequest? body = await httpRequest.ReadFromJsonAsync(AppJsonContext.Default.OcrUrlRequest, ct)
+        .ConfigureAwait(false);
+    string? url = body?.Url;
+    if (string.IsNullOrWhiteSpace(url))
+    {
+        return Results.Json(
+            new OcrResponse
+            {
+                Ok = false,
+                Error = "Request body must be JSON: { \"url\": \"https://.../file.pdf\" }",
+            },
+            AppJsonContext.Default.OcrResponse,
+            statusCode: StatusCodes.Status400BadRequest);
+    }
 
-    string text = result.Text?.Replace("\r", "").Trim() ?? "";
-    string preview = text.Length <= 200 ? text : text[..200] + "…";
-    preview = preview.Replace("\n", " / ");
+    try
+    {
+        ParallelPdfDownloader.DownloadResult download =
+            await downloader.DownloadAsync(url, ct).ConfigureAwait(false);
+        using (download.Buffer)
+        {
+            OcrResponse response = await pipeline
+                .ProcessAsync(download.Buffer, download.ElapsedMs, download.Mode, ct)
+                .ConfigureAwait(false);
+            return Results.Json(response, AppJsonContext.Default.OcrResponse);
+        }
+    }
+    catch (ArgumentException ex)
+    {
+        return Results.Json(
+            new OcrResponse { Ok = false, Error = ex.Message },
+            AppJsonContext.Default.OcrResponse,
+            statusCode: StatusCodes.Status400BadRequest);
+    }
+    catch (HttpRequestException ex)
+    {
+        logger.LogWarning(ex, "Download failed for {Url}", url);
+        return Results.Json(
+            new OcrResponse { Ok = false, Error = "Failed to download PDF: " + ex.Message },
+            AppJsonContext.Default.OcrResponse,
+            statusCode: StatusCodes.Status502BadGateway);
+    }
+    catch (InvalidOperationException ex)
+    {
+        return Results.Json(
+            new OcrResponse { Ok = false, Error = ex.Message },
+            AppJsonContext.Default.OcrResponse,
+            statusCode: StatusCodes.Status400BadRequest);
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "OCR pipeline failed for {Url}", url);
+        return Results.Json(
+            new OcrResponse { Ok = false, Error = "OCR failed: " + ex.Message },
+            AppJsonContext.Default.OcrResponse,
+            statusCode: StatusCodes.Status500InternalServerError);
+    }
+});
 
-    Console.WriteLine($"--- Page {i + 1}/{pageCount} ({image.Width}x{image.Height}) ---");
-    Console.WriteLine($"  Rasterize: {rasterMs:F1} ms");
-    Console.WriteLine($"  OCR:       {ocrMs:F1} ms");
-    Console.WriteLine($"  Preview:   {preview}");
-    Console.WriteLine();
-}
+app.MapGet("/", () => Results.Text(
+    "MiniOcr AOT API\nPOST /ocr  {\"url\":\"https://.../file.pdf\"}\nGET  /health\n",
+    "text/plain; charset=utf-8"));
 
-double totalOcrSec = totalOcrMs / 1000.0;
-double msPerPage = pageCount > 0 ? totalOcrMs / pageCount : 0;
-double pagesPerSec = totalOcrSec > 0 ? pageCount / totalOcrSec : 0;
-double totalPipelineMs = totalRasterizeMs + totalOcrMs;
+string urls = string.Join(", ", app.Urls.DefaultIfEmpty("(default http://localhost:5000)"));
+logger.LogInformation(
+    "MiniOcr ready — engines={Engines}, lineWorkers={LineWorkers}, listening={Urls}",
+    engine.EngineCount,
+    engine.LineWorkerCount,
+    urls);
 
-Console.WriteLine("========== Summary ==========");
-Console.WriteLine($"Pages:              {pageCount}");
-Console.WriteLine($"Model load:         {modelLoadMs:F1} ms");
-Console.WriteLine($"Rasterize total:    {totalRasterizeMs:F1} ms ({totalRasterizeMs / 1000.0:F3} s)");
-Console.WriteLine($"OCR total:          {totalOcrMs:F1} ms ({totalOcrSec:F3} s)");
-Console.WriteLine($"Pipeline (r+ocr):   {totalPipelineMs:F1} ms ({totalPipelineMs / 1000.0:F3} s)");
-Console.WriteLine($"OCR ms/page:        {msPerPage:F1} ms");
-Console.WriteLine($"OCR pages/sec:      {pagesPerSec:F2}");
-Console.WriteLine("Per-page OCR ms:     " + string.Join(", ", pageOcrMs.Select(m => m.ToString("F1"))));
-
-Console.WriteLine();
-Console.WriteLine(
-    $"BENCH_JSON:{{\"pages\":{pageCount},\"model_load_ms\":{modelLoadMs:F1},\"rasterize_ms\":{totalRasterizeMs:F1},\"ocr_ms\":{totalOcrMs:F1},\"ocr_sec\":{totalOcrSec:F3},\"ms_per_page\":{msPerPage:F1},\"pages_per_sec\":{pagesPerSec:F2}}}");
+await app.RunAsync();
