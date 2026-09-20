@@ -2,7 +2,7 @@
 
 基于 [Sdcb.SimdPaddleOCR](https://github.com/sdcb/SimdPaddleOCR) 的 **Native AOT** PDF OCR HTTP API（**.NET 11 RC / `net11.0`**）。
 
-从 URL 并发下载 PDF（≤300 MB），按页流式栅格化 + OCR（最多约 2000 页），返回每页文本与耗时 JSON。模型为 PP-OCRv6 **ChineseV6Tiny**。
+从 URL 并发下载 PDF（≤300 MB），按页流式栅格化 + OCR（最多约 2000 页），返回每页文本、耗时，以及启发式抽取的 **公司名 / 人名** JSON。模型为 PP-OCRv6 **ChineseV6Tiny**。
 
 ## 环境要求
 
@@ -93,6 +93,21 @@ curl -sS http://127.0.0.1:5080/health
 | `timings.totalMs` | 端到端（含下载） |
 | `pages[].text` | 该页识别文本 |
 | `pages[].rasterizeMs` / `ocrMs` | 单页耗时 |
+| `entities.companies[]` | 全局去重公司名：`name` / `pages` / `count` |
+| `entities.persons[]` | 全局去重人名：`name` / `pages` / `count` |
+
+### 实体抽取（启发式 NER）
+
+OCR 每页文本就绪后立即做轻量抽取（相对 OCR 可忽略），再全局合并去重。实现为 **Regex + 百家姓 HashSet**（`[GeneratedRegex]`），**无 ML NER 包**，Native AOT / trim 安全。
+
+| 类型 | 规则（摘要） |
+| --- | --- |
+| 公司名 | 中文组织后缀（有限公司 / 股份有限公司 / 集团 / 事务所 / 银行 / 大学 / …）；英文 Inc/Ltd/Corp/LLC/Co.；标签 `公司名称：` / `甲方：` / `乙方：` 等 |
+| 人名 | 常见百家姓（含欧阳等复姓）+ 1–2 字名；职称后缀（先生/女士/经理/董事…）；标签 `姓名：` / `负责人：` / `法定代表人：`；英文 `John Smith` 式 |
+
+冒烟：`dotnet run -c Release --project tests/MiniOcr.EntitySmoke`
+
+**局限（会漏 / 会误）：** 非标准简称（如「华为」无后缀且无标签）、OCR 错字导致后缀断裂、罕见姓、少数民族长名、纯英文全大写、嵌在表格无标点中的碎片、以及「李宁体育…有限公司」类需启发式抑制误抽人名——**不是**生产级 ML NER，竞赛/合同场景请人工复核关键实体。
 
 ## Native AOT 注意（avx2）
 
@@ -116,6 +131,7 @@ curl -sS http://127.0.0.1:5080/health
 | 下载 | `HttpClient`：若 `Accept-Ranges: bytes` 且已知 `Content-Length`，则并行 Range 写入预分配缓冲；否则单流写入预分配/可控增长缓冲。硬顶 **300 MB**。缓冲来自 `ArrayPool<byte>`。 |
 | 栅格化 | PDFtoImage（PDFium + SkiaSharp），默认 **96 DPI**；每 worker **一次** `PdfDocument.Load` + `ToImages`（避免逐页 `ToImage` 重载）；`AntiAliasing=None` + `Grayscale`（仍输出 BGRA）；多生产者写入有界 Channel（窗口 ≈ `2 ×` OCR 引擎数），**绝不**同时持有全部页位图。 |
 | OCR | 复用多个 `PaddleOcrAll`（ChineseV6Tiny，默认可关 CLS）；页级引擎池互斥租用；`LineWorkerCount` / `DetIntraOpThreads` 做页内并行。Skia **BGRA** 直接喂 OCR，无 ImageSharp 中间拷贝。 |
+| 实体 | `EntityExtractor`：页级 Regex/姓氏集 → `EntityAccumulator` 合并；写入 `entities`。 |
 | JSON | 源生成 `AppJsonContext`，AOT 友好。 |
 
 ### 峰值内存（量级，非承诺值）
@@ -154,6 +170,8 @@ miniocr/
     RentedBuffer.cs
     OcrEngine.cs
     PdfOcrPipeline.cs
+    EntityExtractor.cs    # 启发式公司名/人名
+  tests/MiniOcr.EntitySmoke/  # 实体抽取冒烟
   samples/sample-multipage.pdf
   README.md
 ```

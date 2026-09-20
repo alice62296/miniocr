@@ -72,6 +72,7 @@ public sealed class PdfOcrPipeline
             Grayscale: true);
 
         OcrPageResult[] pages = new OcrPageResult[pageCount];
+        EntityAccumulator entityAcc = new();
 
         Channel<(int Index, SKBitmap Bitmap, double RasterMs)> rasterized =
             Channel.CreateBounded<(int, SKBitmap, double)>(new BoundedChannelOptions(_pageWindow)
@@ -115,15 +116,17 @@ public sealed class PdfOcrPipeline
                         }, ct).ConfigureAwait(false);
                         ocrSw.Stop();
 
+                        string pageText = result.Text?.Replace("\r", "").Trim() ?? "";
                         pages[index] = new OcrPageResult
                         {
                             Page = index + 1,
                             Width = width,
                             Height = height,
-                            Text = result.Text?.Replace("\r", "").Trim() ?? "",
+                            Text = pageText,
                             RasterizeMs = Math.Round(rasterMs, 1),
                             OcrMs = Math.Round(ocrSw.Elapsed.TotalMilliseconds, 1),
                         };
+                        EntityExtractor.ExtractPage(pageText, index + 1, entityAcc);
 
                         lock (timingLock)
                         {
@@ -164,6 +167,7 @@ public sealed class PdfOcrPipeline
                 TotalMs = Math.Round(totalSw.Elapsed.TotalMilliseconds, 1),
             },
             Pages = pages.ToList(),
+            Entities = EntityExtractor.ToEntities(entityAcc),
         };
     }
 

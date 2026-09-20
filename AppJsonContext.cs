@@ -11,6 +11,9 @@ namespace MiniOcr;
 [JsonSerializable(typeof(OcrResponse))]
 [JsonSerializable(typeof(OcrPageResult))]
 [JsonSerializable(typeof(OcrTimings))]
+[JsonSerializable(typeof(OcrEntities))]
+[JsonSerializable(typeof(EntityHit))]
 [JsonSerializable(typeof(HealthResponse))]
 [JsonSerializable(typeof(List<OcrPageResult>))]
+[JsonSerializable(typeof(List<EntityHit>))]
 internal partial class AppJsonContext : JsonSerializerContext;

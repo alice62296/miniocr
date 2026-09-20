@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net11.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>MiniOcr.EntitySmoke</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <!-- Smoke only: no AOT publish needed -->
+    <PublishAot>false</PublishAot>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\..\Services\EntityExtractor.cs" Link="EntityExtractor.cs" />
+    <Compile Include="..\..\Models\OcrModels.cs" Link="OcrModels.cs" />
+  </ItemGroup>
+</Project>

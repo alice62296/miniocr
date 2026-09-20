@@ -25,6 +25,19 @@ public sealed class OcrTimings
     public double TotalMs { get; set; }
 }
 
+public sealed class EntityHit
+{
+    public string Name { get; set; } = "";
+    public List<int> Pages { get; set; } = [];
+    public int Count { get; set; }
+}
+
+public sealed class OcrEntities
+{
+    public List<EntityHit> Companies { get; set; } = [];
+    public List<EntityHit> Persons { get; set; } = [];
+}
+
 public sealed class OcrResponse
 {
     public bool Ok { get; set; }
@@ -34,6 +47,7 @@ public sealed class OcrResponse
     public int Dpi { get; set; }
     public OcrTimings Timings { get; set; } = new();
     public List<OcrPageResult> Pages { get; set; } = [];
+    public OcrEntities? Entities { get; set; }
     public string? Error { get; set; }
 }
 
@@ -52,4 +66,3 @@ public sealed class HealthResponse
     public int RecBatchLines { get; set; }
     public int DetLimitSideLength { get; set; }
 }
-
