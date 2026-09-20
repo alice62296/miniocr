@@ -30,8 +30,8 @@ public sealed class OcrRuntimeConfig
         int line = Math.Clamp(ReadInt("MINIOCR_LINE_WORKERS", lineDefault), 1, 16);
         int det = Math.Clamp(ReadInt("MINIOCR_DET_THREADS", detDefault), 1, 16);
 
-        // Competition default: 45 DPI — speed-first ZH+EN; ~(45/150)^2 ≈ 9% pixels vs baseline 150.
-        int dpi = Math.Clamp(ReadInt("MINIOCR_DPI", 45), 36, 300);
+        // Default 96 DPI — balanced ZH+EN readability vs throughput; ~(96/150)^2 ≈ 41% pixels vs baseline 150.
+        int dpi = Math.Clamp(ReadInt("MINIOCR_DPI", 96), 36, 300);
 
         bool useCls = ReadBool("MINIOCR_USE_CLS", false);
 
