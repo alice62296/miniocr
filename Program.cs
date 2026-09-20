@@ -23,11 +23,20 @@ using ILoggerFactory bootstrapLogs = LoggerFactory.Create(logging =>
     logging.SetMinimumLevel(LogLevel.Information);
 });
 
+OcrRuntimeConfig runtimeConfig = OcrRuntimeConfig.FromEnvironment();
+
 Console.WriteLine($"Runtime: {RuntimeInformation.FrameworkDescription}");
 Console.WriteLine($"OS: {RuntimeInformation.OSDescription} ({RuntimeInformation.OSArchitecture})");
+Console.WriteLine(
+    $"OCR knobs: engines={runtimeConfig.EngineCount}, dpi={runtimeConfig.DefaultDpi}, " +
+    $"lineWorkers={runtimeConfig.LineWorkerCount}, detThreads={runtimeConfig.DetIntraOpThreads}, " +
+    $"useCls={runtimeConfig.UseDirectionClassification}, rasterWorkers={runtimeConfig.RasterWorkerCount}");
 Console.WriteLine("Loading ChineseV6Tiny OCR models...");
 
-OcrEngine engine = await OcrEngine.CreateAsync(bootstrapLogs.CreateLogger<OcrEngine>());
+OcrEngine engine = await OcrEngine.CreateAsync(
+    bootstrapLogs.CreateLogger<OcrEngine>(),
+    runtimeConfig);
+builder.Services.AddSingleton(runtimeConfig);
 builder.Services.AddSingleton(engine);
 builder.Services.AddSingleton<PdfOcrPipeline>();
 
@@ -47,6 +56,14 @@ app.MapGet("/health", (OcrEngine ocr) => Results.Json(
         ModelsLoaded = ocr.IsLoaded,
         Runtime = RuntimeInformation.FrameworkDescription,
         ProcessorCount = Environment.ProcessorCount,
+        EngineCount = ocr.EngineCount,
+        LineWorkerCount = ocr.LineWorkerCount,
+        DetIntraOpThreads = ocr.DetIntraOpThreads,
+        DefaultDpi = ocr.Config.DefaultDpi,
+        UseDirectionClassification = ocr.UseDirectionClassification,
+        RasterWorkerCount = ocr.Config.RasterWorkerCount,
+        RecBatchLines = ocr.Config.RecBatchLines,
+        DetLimitSideLength = ocr.Config.DetLimitSideLength,
     },
     AppJsonContext.Default.HealthResponse));
 
@@ -54,6 +71,7 @@ app.MapPost("/ocr", async Task<IResult> (
     HttpRequest httpRequest,
     ParallelPdfDownloader downloader,
     PdfOcrPipeline pipeline,
+    OcrRuntimeConfig config,
     CancellationToken ct) =>
 {
     OcrUrlRequest? body = await httpRequest.ReadFromJsonAsync(AppJsonContext.Default.OcrUrlRequest, ct)
@@ -65,11 +83,21 @@ app.MapPost("/ocr", async Task<IResult> (
             new OcrResponse
             {
                 Ok = false,
-                Error = "Request body must be JSON: { \"url\": \"https://.../file.pdf\" }",
+                Error = "Request body must be JSON: { \"url\": \"https://.../file.pdf\", \"dpi\": 96 }",
             },
             AppJsonContext.Default.OcrResponse,
             statusCode: StatusCodes.Status400BadRequest);
     }
+
+    int? dpi = body?.Dpi;
+    if (dpi is null &&
+        httpRequest.Query.TryGetValue("dpi", out var dpiQuery) &&
+        int.TryParse(dpiQuery.FirstOrDefault(), out int dpiFromQuery))
+    {
+        dpi = dpiFromQuery;
+    }
+
+    dpi ??= config.DefaultDpi;
 
     try
     {
@@ -78,7 +106,7 @@ app.MapPost("/ocr", async Task<IResult> (
         using (download.Buffer)
         {
             OcrResponse response = await pipeline
-                .ProcessAsync(download.Buffer, download.ElapsedMs, download.Mode, ct)
+                .ProcessAsync(download.Buffer, download.ElapsedMs, download.Mode, ct, dpi)
                 .ConfigureAwait(false);
             return Results.Json(response, AppJsonContext.Default.OcrResponse);
         }
@@ -116,14 +144,19 @@ app.MapPost("/ocr", async Task<IResult> (
 });
 
 app.MapGet("/", () => Results.Text(
-    "MiniOcr AOT API\nPOST /ocr  {\"url\":\"https://.../file.pdf\"}\nGET  /health\n",
+    "MiniOcr AOT API\n" +
+    "POST /ocr  {\"url\":\"https://.../file.pdf\",\"dpi\":96}\n" +
+    "GET  /health\n" +
+    "Env: MINIOCR_ENGINES MINIOCR_DPI MINIOCR_LINE_WORKERS MINIOCR_DET_THREADS MINIOCR_USE_CLS MINIOCR_RASTER_WORKERS MINIOCR_REC_BATCH MINIOCR_DET_LIMIT_SIDE\n",
     "text/plain; charset=utf-8"));
 
 string urls = string.Join(", ", app.Urls.DefaultIfEmpty("(default http://localhost:5000)"));
 logger.LogInformation(
-    "MiniOcr ready — engines={Engines}, lineWorkers={LineWorkers}, listening={Urls}",
+    "MiniOcr ready — engines={Engines}, lineWorkers={LineWorkers}, dpi={Dpi}, useCls={UseCls}, listening={Urls}",
     engine.EngineCount,
     engine.LineWorkerCount,
+    engine.Config.DefaultDpi,
+    engine.UseDirectionClassification,
     urls);
 
 await app.RunAsync();

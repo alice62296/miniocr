@@ -1,11 +1,8 @@
 using System.Diagnostics;
-using System.Runtime.InteropServices;
 using System.Threading.Channels;
 using MiniOcr.Models;
 using PDFtoImage;
 using Sdcb.SimdPaddleOCR;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.PixelFormats;
 using SkiaSharp;
 
 namespace MiniOcr.Services;
@@ -15,37 +12,41 @@ public sealed class PdfOcrPipeline
     private readonly OcrEngine _engine;
     private readonly ILogger<PdfOcrPipeline> _logger;
     private readonly int _pageWindow;
+    private readonly int _defaultDpi;
+    private readonly int _rasterWorkers;
 
     public PdfOcrPipeline(OcrEngine engine, ILogger<PdfOcrPipeline> logger)
     {
         _engine = engine;
         _logger = logger;
-        _pageWindow = Math.Max(2, engine.EngineCount * 2);
+        _pageWindow = Math.Max(4, engine.EngineCount * 2);
+        _defaultDpi = engine.Config.DefaultDpi;
+        _rasterWorkers = engine.Config.RasterWorkerCount;
     }
 
     public Task<OcrResponse> ProcessAsync(
         RentedBuffer pdf,
         double downloadMs,
         string downloadMode,
-        CancellationToken ct)
+        CancellationToken ct,
+        int? dpiOverride = null)
     {
         Stopwatch totalSw = Stopwatch.StartNew();
-        // Wrap rented array with exact Length — no copy; PDFium reads via Stream.
-        MemoryStream pdfStream = new(
-            pdf.DangerousGetArray(),
-            index: 0,
-            count: pdf.Length,
-            writable: false,
-            publiclyVisible: true);
-        return ProcessCoreAsync(pdfStream, pdf.Length, downloadMs, downloadMode, totalSw, ct);
+        byte[] array = pdf.DangerousGetArray();
+        int length = pdf.Length;
+        // Independent MemoryStream over the rented array — producers reset Position locally.
+        MemoryStream pdfStream = new(array, index: 0, count: length, writable: false, publiclyVisible: true);
+        return ProcessCoreAsync(pdfStream, array, length, downloadMs, downloadMode, totalSw, dpiOverride, ct);
     }
 
     private async Task<OcrResponse> ProcessCoreAsync(
         Stream pdfStream,
-        long pdfByteCount,
+        byte[] pdfBytes,
+        int pdfByteCount,
         double downloadMs,
         string downloadMode,
         Stopwatch totalSw,
+        int? dpiOverride,
         CancellationToken ct)
     {
         await using (pdfStream.ConfigureAwait(false))
@@ -56,15 +57,18 @@ public sealed class PdfOcrPipeline
             if (pageCount > 2000)
                 throw new InvalidOperationException($"PDF has {pageCount} pages; max supported is 2000.");
 
-            _logger.LogInformation("OCR pipeline start: {Pages} pages, {Bytes} bytes PDF", pageCount, pdfByteCount);
+            int dpi = Math.Clamp(dpiOverride ?? _defaultDpi, 36, 300);
+            _logger.LogInformation(
+                "OCR pipeline start: {Pages} pages, {Bytes} bytes PDF, dpi={Dpi}, engines={Engines}, rasterWorkers={Raster}",
+                pageCount, pdfByteCount, dpi, _engine.EngineCount, _rasterWorkers);
 
-            RenderOptions renderOptions = new(Dpi: 150);
+            RenderOptions renderOptions = new(Dpi: dpi);
             OcrPageResult[] pages = new OcrPageResult[pageCount];
 
             Channel<(int Index, SKBitmap Bitmap, double RasterMs)> rasterized =
                 Channel.CreateBounded<(int, SKBitmap, double)>(new BoundedChannelOptions(_pageWindow)
                 {
-                    SingleWriter = true,
+                    SingleWriter = false,
                     SingleReader = false,
                     FullMode = BoundedChannelFullMode.Wait,
                 });
@@ -73,42 +77,56 @@ public sealed class PdfOcrPipeline
             double ocrTotal = 0;
             object timingLock = new();
 
-            Task producer = ProduceAsync(pdfStream, pageCount, renderOptions, rasterized.Writer, ct);
+            Task producer = ProduceParallelAsync(
+                pdfBytes, pdfByteCount, pageCount, renderOptions, rasterized.Writer, ct);
 
             async Task ConsumerAsync()
             {
-                Configuration imgConfig = ContiguousConfig();
                 await foreach (var (index, bitmap, rasterMs) in rasterized.Reader.ReadAllAsync(ct)
                                    .ConfigureAwait(false))
                 {
                     using (bitmap)
-                    using (Image<Rgba32> image = SkBitmapToRgba32(bitmap, imgConfig))
                     {
-                        if (!image.DangerousTryGetSinglePixelMemory(out Memory<Rgba32> memory))
-                            throw new InvalidDataException($"Page {index + 1}: pixels are not contiguous.");
-
-                        Stopwatch ocrSw = Stopwatch.StartNew();
-                        PaddleOcrResult result = await _engine.UseAsync(ocr => ocr.Run(
-                            MemoryMarshal.AsBytes(memory.Span),
-                            image.Width,
-                            image.Height,
-                            format: ImagePixelFormat.Rgba32), ct).ConfigureAwait(false);
-                        ocrSw.Stop();
-
-                        pages[index] = new OcrPageResult
+                        EnsureBgra8888(bitmap, out SKBitmap working, out bool ownedWorking);
+                        try
                         {
-                            Page = index + 1,
-                            Width = image.Width,
-                            Height = image.Height,
-                            Text = result.Text?.Replace("\r", "").Trim() ?? "",
-                            RasterizeMs = Math.Round(rasterMs, 1),
-                            OcrMs = Math.Round(ocrSw.Elapsed.TotalMilliseconds, 1),
-                        };
+                            Stopwatch ocrSw = Stopwatch.StartNew();
+                            int width = working.Width;
+                            int height = working.Height;
+                            int stride = working.RowBytes;
+                            IntPtr pixels = working.GetPixels();
+                            int byteCount = stride * height;
 
-                        lock (timingLock)
+                            PaddleOcrResult result = await _engine.UseAsync(ocr =>
+                            {
+                                unsafe
+                                {
+                                    ReadOnlySpan<byte> span = new((void*)pixels, byteCount);
+                                    return ocr.Run(span, width, height, stride, ImagePixelFormat.Bgra32);
+                                }
+                            }, ct).ConfigureAwait(false);
+                            ocrSw.Stop();
+
+                            pages[index] = new OcrPageResult
+                            {
+                                Page = index + 1,
+                                Width = width,
+                                Height = height,
+                                Text = result.Text?.Replace("\r", "").Trim() ?? "",
+                                RasterizeMs = Math.Round(rasterMs, 1),
+                                OcrMs = Math.Round(ocrSw.Elapsed.TotalMilliseconds, 1),
+                            };
+
+                            lock (timingLock)
+                            {
+                                rasterTotal += rasterMs;
+                                ocrTotal += ocrSw.Elapsed.TotalMilliseconds;
+                            }
+                        }
+                        finally
                         {
-                            rasterTotal += rasterMs;
-                            ocrTotal += ocrSw.Elapsed.TotalMilliseconds;
+                            if (ownedWorking)
+                                working.Dispose();
                         }
                     }
                 }
@@ -129,6 +147,7 @@ public sealed class PdfOcrPipeline
                 PageCount = pageCount,
                 PdfBytes = pdfByteCount,
                 DownloadMode = downloadMode,
+                Dpi = dpi,
                 Timings = new OcrTimings
                 {
                     DownloadMs = Math.Round(downloadMs, 1),
@@ -141,28 +160,45 @@ public sealed class PdfOcrPipeline
         }
     }
 
-    private static async Task ProduceAsync(
-        Stream pdfStream,
+    private async Task ProduceParallelAsync(
+        byte[] pdfBytes,
+        int pdfLength,
         int pageCount,
         RenderOptions renderOptions,
         ChannelWriter<(int, SKBitmap, double)> writer,
         CancellationToken ct)
     {
+        int workers = Math.Clamp(_rasterWorkers, 1, Math.Max(1, pageCount));
         try
         {
-            for (int i = 0; i < pageCount; i++)
+            Task[] tasks = new Task[workers];
+            for (int w = 0; w < workers; w++)
             {
-                ct.ThrowIfCancellationRequested();
-                Stopwatch sw = Stopwatch.StartNew();
-                SKBitmap bitmap;
-                lock (pdfStream)
+                int workerId = w;
+                tasks[w] = Task.Run(async () =>
                 {
-                    pdfStream.Position = 0;
-                    bitmap = Conversion.ToImage(pdfStream, i, leaveOpen: true, options: renderOptions);
-                }
-                sw.Stop();
-                await writer.WriteAsync((i, bitmap, sw.Elapsed.TotalMilliseconds), ct).ConfigureAwait(false);
+                    // Each raster worker gets its own stream over the same rented bytes (read-only).
+                    using MemoryStream local = new(
+                        pdfBytes, index: 0, count: pdfLength, writable: false, publiclyVisible: true);
+                    for (int i = workerId; i < pageCount; i += workers)
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        Stopwatch sw = Stopwatch.StartNew();
+                        SKBitmap bitmap;
+                        lock (local)
+                        {
+                            local.Position = 0;
+                            bitmap = Conversion.ToImage(local, i, leaveOpen: true, options: renderOptions);
+                        }
+
+                        sw.Stop();
+                        await writer.WriteAsync((i, bitmap, sw.Elapsed.TotalMilliseconds), ct)
+                            .ConfigureAwait(false);
+                    }
+                }, ct);
             }
+
+            await Task.WhenAll(tasks).ConfigureAwait(false);
         }
         finally
         {
@@ -170,41 +206,17 @@ public sealed class PdfOcrPipeline
         }
     }
 
-    private static Configuration ContiguousConfig()
+    private static void EnsureBgra8888(SKBitmap source, out SKBitmap working, out bool owned)
     {
-        Configuration config = Configuration.Default.Clone();
-        config.PreferContiguousImageBuffers = true;
-        return config;
-    }
-
-    private static Image<Rgba32> SkBitmapToRgba32(SKBitmap bitmap, Configuration config)
-    {
-        using SKBitmap copy = bitmap.Copy(SKColorType.Rgba8888)
-            ?? throw new InvalidOperationException("Failed to convert SKBitmap to RGBA8888.");
-
-        Image<Rgba32> image = new(config, copy.Width, copy.Height);
-        if (!image.DangerousTryGetSinglePixelMemory(out Memory<Rgba32> memory))
+        if (source.ColorType == SKColorType.Bgra8888)
         {
-            Rgba32[] buffer = GC.AllocateUninitializedArray<Rgba32>(copy.Width * copy.Height);
-            Span<byte> dest = MemoryMarshal.AsBytes(buffer.AsSpan());
-            IntPtr pixels = copy.GetPixels();
-            unsafe
-            {
-                new ReadOnlySpan<byte>((void*)pixels, copy.ByteCount).CopyTo(dest);
-            }
-            image.Dispose();
-            image = Image.LoadPixelData<Rgba32>(config, buffer, copy.Width, copy.Height);
-            if (!image.DangerousTryGetSinglePixelMemory(out _))
-                throw new InvalidDataException("ImageSharp pixels are not contiguous after fallback.");
-            return image;
+            working = source;
+            owned = false;
+            return;
         }
 
-        Span<byte> destBytes = MemoryMarshal.AsBytes(memory.Span);
-        IntPtr srcPixels = copy.GetPixels();
-        unsafe
-        {
-            new ReadOnlySpan<byte>((void*)srcPixels, copy.ByteCount).CopyTo(destBytes);
-        }
-        return image;
+        working = source.Copy(SKColorType.Bgra8888)
+            ?? throw new InvalidOperationException("Failed to convert SKBitmap to BGRA8888.");
+        owned = true;
     }
 }
