@@ -53,7 +53,7 @@ dotnet run -c Release --urls http://127.0.0.1:5080
 | `MINIOCR_LINE_WORKERS` | **4** | 页内 CLS/REC 并行（`LineWorkerCount`） |
 | `MINIOCR_DET_THREADS` | **2** | 检测图内卷积线程（`DetIntraOpThreads`） |
 | `MINIOCR_USE_CLS` | **false** | 是否启用方向分类（关闭可提速并少占内存） |
-| `MINIOCR_RASTER_WORKERS` | **4** | 并行 PDF 栅格化生产者数 |
+| `MINIOCR_RASTER_WORKERS` | **4** | 并行 PDF 栅格化生产者数（实测甜区 **2–4**；>4 与 OCR 争用 CPU） |
 | `MINIOCR_REC_BATCH` | **8** | `RecBatchLines` |
 | `MINIOCR_DET_LIMIT_SIDE` | **960** | 检测 `LimitSideLength` |
 
@@ -114,7 +114,7 @@ curl -sS http://127.0.0.1:5080/health
 | 环节 | 策略 |
 | --- | --- |
 | 下载 | `HttpClient`：若 `Accept-Ranges: bytes` 且已知 `Content-Length`，则并行 Range 写入预分配缓冲；否则单流写入预分配/可控增长缓冲。硬顶 **300 MB**。缓冲来自 `ArrayPool<byte>`。 |
-| 栅格化 | PDFtoImage（PDFium + SkiaSharp），默认 **96 DPI**；多生产者写入有界 Channel（窗口 ≈ `2 ×` OCR 引擎数），**绝不**同时持有全部页位图。 |
+| 栅格化 | PDFtoImage（PDFium + SkiaSharp），默认 **96 DPI**；每 worker **一次** `PdfDocument.Load` + `ToImages`（避免逐页 `ToImage` 重载）；`AntiAliasing=None` + `Grayscale`（仍输出 BGRA）；多生产者写入有界 Channel（窗口 ≈ `2 ×` OCR 引擎数），**绝不**同时持有全部页位图。 |
 | OCR | 复用多个 `PaddleOcrAll`（ChineseV6Tiny，默认可关 CLS）；页级引擎池互斥租用；`LineWorkerCount` / `DetIntraOpThreads` 做页内并行。Skia **BGRA** 直接喂 OCR，无 ImageSharp 中间拷贝。 |
 | JSON | 源生成 `AppJsonContext`，AOT 友好。 |
 
@@ -160,12 +160,14 @@ miniocr/
 
 ## 实测：2000 页（AOT，请勿伪造）
 
-以下数字来自本机 **Native AOT** 对 `samples/sample-2000.pdf`（2000 页，中英混合文本）的真实 `POST /ocr`（Asia/Shanghai）：
+以下数字来自本机对 `samples/sample-2000.pdf`（2000 页，中英混合文本）的真实测量（Asia/Shanghai）：
 
-| 项 | 旧默认 DPI 45 | **当前默认 DPI 96** |
+### 端到端 OCR（优化前，Native AOT）
+
+| 项 | 旧默认 DPI 45 | DPI 96（栅格优化前） |
 | --- | ---: | ---: |
 | 日期 | 2026-09-20 23:52 CST | **2026-09-21 07:10–07:18 CST** |
-| 配置 | DPI 45 / 引擎 4 / Line 4 / Det 2 / CLS off | **DPI 96 / 引擎 4 / Line 4 / Det 2 / CLS off** |
+| 配置 | DPI 45 / 引擎 4 / Line 4 / Det 2 / CLS off | **DPI 96 / 引擎 4 / Line 4 / Det 2 / CLS off / raster 4** |
 | 模型 | ChineseV6Tiny | **ChineseV6Tiny** |
 | `timings.totalMs` | 248,854.5（~4.15 min） | **456,691.7（~7.61 min）** |
 | pages/sec | 8.037 | **4.379** |
@@ -176,11 +178,26 @@ miniocr/
 | ocrMs（页合计） | 994,282 | **1,823,128.4** |
 | 页尺寸（宽×高） | 372 × 526 | **793 × 1122** |
 
+### 栅格化加速（2026-09-21，DPI 96）
+
+瓶颈在 **native PDFium**（逐页 `Conversion.ToImage` 会 **每页重新 Load** PDF）。托管 SIMD 帮不上忙（无像素拷贝；Skia 已是 BGRA）。PDFium/Skia 自身已用原生 SIMD。
+
+| 场景 | 页数 | workers | wall | 页合计（≈`rasterizeMs`） | ms/页（合计） |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 优化前 `ToImage`/页 | 2000 | 4 | 27,323 ms | 108,057 ms | 54.0 |
+| **优化后** `ToImages`+AA=None+Gray | 2000 | 4 | **2,751 ms** | **10,866 ms** | **5.43** |
+| 同上 | 2000 | 2 | 2,611 ms | 5,176 ms | 2.59 |
+| 流水线冒烟（非 AOT，含 OCR） | 200 | 4 | total 22.7 s | **rasterizeMs 882** | 4.4 |
+
+约 **~10×** 栅格 wall / **~4–5×** 相对端到端里旧的 `rasterizeMs≈46.9 s`（流水线与 OCR 争用下页合计更接近 ~11 s）。OCR 仍占主导，端到端总时长几乎不变。
+
+**未换引擎：** Docnet / 直连 Pdfium / MuPDF 探针无必要——文档复用 + 关闭 AA 已吃掉主要浪费；PDFtoImage 已 AOT 友好。
+
 更早基线（DPI 150 / 引擎 2 / CLS on）：`totalMs` 838,569.1（~14.0 min）。
 
 冒烟（5 页 `sample-multipage.pdf`）仍可用于快速验证；大吞吐请以 2000 页表为准。
 
-**精度 / 速度权衡：** 默认 DPI 96 相对 150 像素面积约 41%，相对旧默认 45 约 4.6×；中文细部明显好于 45。若需 &lt;5 min / 2000 页可降 `MINIOCR_DPI=45`；更高精度可设 `MINIOCR_DPI=150` 并视情况开启 `MINIOCR_USE_CLS=1`。
+**精度 / 速度权衡：** 默认 DPI 96 相对 150 像素面积约 41%，相对旧默认 45 约 4.6×；中文细部明显好于 45。栅格默认 `AntiAliasing=None` + `Grayscale`（仍 BGRA，利于 OCR 锐利字形）。若需 &lt;5 min / 2000 页可降 `MINIOCR_DPI=45`；更高精度可设 `MINIOCR_DPI=150` 并视情况开启 `MINIOCR_USE_CLS=1`。
 
 ## 许可证
 

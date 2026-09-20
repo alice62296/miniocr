@@ -35,7 +35,8 @@ public sealed class OcrRuntimeConfig
 
         bool useCls = ReadBool("MINIOCR_USE_CLS", false);
 
-        // Parallel PDF raster producers (each owns a MemoryStream view of the PDF bytes).
+        // Parallel PDF raster producers (one PdfDocument.Load + ToImages stream each).
+        // Measured sweet spot is 2–4 on 8-core; >4 adds contention with OCR. Default min(engines, 4).
         int raster = Math.Clamp(ReadInt("MINIOCR_RASTER_WORKERS", Math.Min(engines, 4)), 1, 8);
         int recBatch = Math.Clamp(ReadInt("MINIOCR_REC_BATCH", 8), 1, 64);
         int detLimit = Math.Clamp(ReadInt("MINIOCR_DET_LIMIT_SIDE", 960), 64, 4096);
