@@ -12,7 +12,7 @@
 https://<你的公网主机>:5080/challenge
 ```
 
-也支持把 serviceUrl 填成根路径 `https://<host>:5080/`（`POST /` 与 `POST /challenge` 等价）。调试用同步接口 `POST /ocr` 仍保留；`GET /health` 用于探活。
+也支持把 serviceUrl 填成根路径 `https://<host>:5080/`（`POST /` 与 `POST /challenge` 等价）。调试用同步接口 `POST /ocr` 使用**与回调相同的 JSON 形状**（见下）；`GET /health` 用于探活。
 
 ### 平台 → 本服务（须快速返回 200）
 
@@ -223,7 +223,7 @@ dotnet run -c Release --urls http://127.0.0.1:5080
 | `MINIOCR_REC_BATCH` | — | **8** | `RecBatchLines` |
 | `MINIOCR_DET_LIMIT_SIDE` | — | **960** | 检测 `LimitSideLength` |
 
-请求体也可覆盖 DPI：`{"url":"...","dpi":150}` 或 `POST /ocr?dpi=150`。
+调试 `/ocr` 可通过查询参数或遗留字段覆盖 DPI：`POST /ocr?dpi=150`，或 body 内 `"dpi":150`（竞赛字段优先；也可用遗留 `{"url":"...","dpi":150}`）。
 
 #### CPU 自动扩缩（`autoScaleFromCpu`，默认 true）
 
@@ -239,16 +239,67 @@ dotnet run -c Release --urls http://127.0.0.1:5080
 
 > 更快可降 `MINIOCR_DPI=45`；更高精度可设 `MINIOCR_DPI=150`、`MINIOCR_USE_CLS=1`。显式设置 env/文件中的 engines 等会关闭对该项的自动推算。
 
+### 调试同步 `POST /ocr`（形状对齐竞赛回调）
+
+本地调试时 `/ocr` **同步等待**并在响应体返回结果；请求/响应 JSON 尽量与竞赛协议一致，映射复用 `ChallengeResultMapper`（与异步回调同一套模型，无分叉）。
+
+**请求**（竞赛兼容；`callbackUrl` 可省略/空，sync 不回调）：
+
+```json
+{
+  "teamId": 0,
+  "key": "debug",
+  "callbackUrl": "",
+  "files": [{ "fileId": "f1", "url": "http://127.0.0.1:8000/sample-multipage.pdf" }]
+}
+```
+
+至少也可只传 `{"files":[{"fileId":"f1","url":"..."}]}`。遗留单文件 `{"url":"...","dpi":96}` 仍支持，会映射为 `files:[{fileId:"f1",url}]`。DPI 也可 `?dpi=` / `MINIOCR_DPI` / 配置文件。
+
+**响应**（与回调 payload 同形）：
+
+```json
+{
+  "teamId": 0,
+  "key": "debug",
+  "result": [
+    {
+      "fileId": "f1",
+      "pages": [
+        {
+          "page": 1,
+          "ruleList": [
+            {
+              "ruleCode": "B04",
+              "ruleName": "人员名称",
+              "ruleItemList": [{ "personName": "…", "count": 1, "originText": ["…"] }]
+            },
+            {
+              "ruleCode": "B06",
+              "ruleName": "公司名称",
+              "ruleItemList": [{ "companyName": "…", "count": 1, "originText": ["…"] }]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+`/challenge` 仍为：快速 200 + 异步回调（见上文）。
+
 ### 示例 curl
 
 ```bash
 # 终端 A：提供示例 PDF
 python3 -m http.server 8000 --directory samples
 
-# 终端 B：调用 OCR API
-curl -sS -X POST http://127.0.0.1:5080/ocr \
-  -H 'Content-Type: application/json' \
-  -d '{"url":"http://127.0.0.1:8000/sample-multipage.pdf"}' | jq .
+# 终端 B：调试同步 OCR（竞赛形状）
+curl -sS -X POST http://127.0.0.1:5080/ocr   -H 'Content-Type: application/json'   -d '{"teamId":0,"key":"debug","files":[{"fileId":"f1","url":"http://127.0.0.1:8000/sample-multipage.pdf"}]}' | jq .
+
+# 遗留单 URL（仍可用）
+curl -sS -X POST 'http://127.0.0.1:5080/ocr?dpi=96'   -H 'Content-Type: application/json'   -d '{"url":"http://127.0.0.1:8000/sample-multipage.pdf"}' | jq .
 ```
 
 健康检查：
@@ -256,23 +307,6 @@ curl -sS -X POST http://127.0.0.1:5080/ocr \
 ```bash
 curl -sS http://127.0.0.1:5080/health
 ```
-
-### 响应字段（摘要）
-
-| 字段 | 说明 |
-| --- | --- |
-| `ok` | 是否成功 |
-| `pageCount` / `pdfBytes` | 页数 / PDF 字节数 |
-| `dpi` | 实际栅格化 DPI |
-| `downloadMode` | `parallel-ranges` / `single-presized` / `single-grow` / … |
-| `timings.downloadMs` | 下载耗时 |
-| `timings.rasterizeMs` | 各页栅格化合计 |
-| `timings.ocrMs` | 各页 OCR 合计 |
-| `timings.totalMs` | 端到端（含下载） |
-| `pages[].text` | 该页识别文本 |
-| `pages[].rasterizeMs` / `ocrMs` | 单页耗时 |
-| `entities.companies[]` | 全局去重公司名：`name` / `pages` / `count` |
-| `entities.persons[]` | 全局去重人名：`name` / `pages` / `count` |
 
 ### 实体抽取（LLM 优先 + 启发式回退）
 
@@ -303,7 +337,7 @@ curl -sS http://127.0.0.1:5080/health
 对 **x64**：**必须**保留 `IlcInstructionSet=avx2`。否则 ILC 按 SSE2 / 128-bit `Vector<T>` 基线编译，`Avx2.IsSupported` 会被折成 `false`，SimdPaddleOCR 的 AVX2 内核整段裁掉，OCR 会慢很多。
 
 - **无 AVX2 的 x64 CPU**：不要下载/运行带 AVX2 的 x64 包（可能无法启动）。请自行去掉 `IlcInstructionSet` 后本地发布，或改用非 AOT。
-- **ARM64**（`linux-arm64` / `osx-arm64`）：不设置 `IlcInstructionSet`（基线含 NEON），与 x64 AVX2 包无关。
+- **ARM64**（`linux-arm64` / `osx-arm64`）：不设置 `IlcInstructionSet`（基线含 NEON），与 x64 AVX2 包无关。macOS **仅发布 Apple Silicon（`osx-arm64`）**，不再构建 Intel `osx-x64`。
 - AOT 禁用反射密集 API；本项目使用 `JsonSerializerContext` + `WebApplication.CreateSlimBuilder`。
 
 ## 下载 CI 产物（GitHub Actions）
@@ -312,8 +346,9 @@ curl -sS http://127.0.0.1:5080/health
 
 1. 打开仓库 **Actions** → 选中 **Publish Native AOT** 某次成功运行。
 2. 在 **Artifacts** 下载对应平台 zip，名称形如：
-   - `miniocr-win-x64` / `miniocr-linux-x64` / `miniocr-osx-x64`（**AVX2**）
-   - `miniocr-osx-arm64` / `miniocr-linux-arm64`（**无 AVX2**）
+   - `miniocr-win-x64` / `miniocr-linux-x64`（**AVX2**）
+   - `miniocr-osx-arm64`（**Apple Silicon only**）/ `miniocr-linux-arm64`（**无 AVX2**）
+   - 不再提供 `osx-x64` / Intel Mac 包
 3. 若通过 **Release** / `v*` 标签触发，zip 也会尽量挂到该 GitHub Release 上，可直接从 Releases 页下载。
 
 解压后目录内含可执行文件与原生依赖（如 `libSkiaSharp` / `pdfium` 的 `.dll` / `.so` / `.dylib`），以及示例 PDF（若打包时存在）。在对应系统上直接运行即可（x64 包要求 CPU 支持 AVX2）。
@@ -350,7 +385,7 @@ curl -sS http://127.0.0.1:5080/health
 | `POST` | `/challenge` | **竞赛 serviceUrl（推荐）**：异步受理，见上文「竞赛协议」 |
 | `POST` | `/` | 与 `/challenge` 相同（可将 serviceUrl 填根路径） |
 | `GET` | `/health` | 健康、模型与当前旋钮 |
-| `POST` | `/ocr` | 调试用同步 OCR：`{"url":"https://.../file.pdf","dpi":96}` |
+| `POST` | `/ocr` | 调试用同步 OCR：竞赛兼容 `files[{fileId,url}]`，响应同回调 `result` 形状（遗留 `{url,dpi?}` 仍可用） |
 | `GET` | `/` | 纯文本接口说明 |
 
 ## 项目结构

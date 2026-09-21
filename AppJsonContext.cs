@@ -7,7 +7,7 @@ namespace MiniOcr;
     PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase,
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
     WriteIndented = false)]
-[JsonSerializable(typeof(OcrUrlRequest))]
+[JsonSerializable(typeof(OcrDebugRequest))]
 [JsonSerializable(typeof(OcrResponse))]
 [JsonSerializable(typeof(OcrPageResult))]
 [JsonSerializable(typeof(OcrTimings))]

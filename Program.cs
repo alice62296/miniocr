@@ -237,22 +237,73 @@ app.MapPost("/ocr", async Task<IResult> (
     OcrRuntimeConfig config,
     CancellationToken ct) =>
 {
-    OcrUrlRequest? body = await httpRequest.ReadFromJsonAsync(AppJsonContext.Default.OcrUrlRequest, ct)
-        .ConfigureAwait(false);
-    string? url = body?.Url;
-    if (string.IsNullOrWhiteSpace(url))
+    // Sync debug OCR: competition-compatible request/response shapes (same builders as callback).
+    OcrDebugRequest? body;
+    try
     {
+        body = await httpRequest.ReadFromJsonAsync(AppJsonContext.Default.OcrDebugRequest, ct)
+            .ConfigureAwait(false);
+    }
+    catch (Exception ex)
+    {
+        logger.LogWarning(ex, "Debug /ocr JSON parse failed");
         return Results.Json(
-            new OcrResponse
-            {
-                Ok = false,
-                Error = "Request body must be JSON: { \"url\": \"https://.../file.pdf\", \"dpi\": 96 }",
-            },
-            AppJsonContext.Default.OcrResponse,
+            new ChallengeAckResponse { Ok = false, Error = "Invalid JSON body." },
+            AppJsonContext.Default.ChallengeAckResponse,
             statusCode: StatusCodes.Status400BadRequest);
     }
 
-    int? dpi = body?.Dpi;
+    if (body is null)
+    {
+        return Results.Json(
+            new ChallengeAckResponse { Ok = false, Error = "Empty body." },
+            AppJsonContext.Default.ChallengeAckResponse,
+            statusCode: StatusCodes.Status400BadRequest);
+    }
+
+    List<ChallengeFileRef> files = [];
+    if (body.Files is { Count: > 0 })
+    {
+        foreach (ChallengeFileRef f in body.Files)
+        {
+            if (string.IsNullOrWhiteSpace(f.Url) || string.IsNullOrWhiteSpace(f.FileId))
+                continue;
+            if (!Uri.TryCreate(f.Url, UriKind.Absolute, out Uri? fu) ||
+                (fu.Scheme != Uri.UriSchemeHttp && fu.Scheme != Uri.UriSchemeHttps))
+                continue;
+            files.Add(f);
+        }
+    }
+    else if (!string.IsNullOrWhiteSpace(body.Url))
+    {
+        // Legacy { "url", "dpi" } → files:[{fileId:"f1",url}]
+        if (!Uri.TryCreate(body.Url, UriKind.Absolute, out Uri? fu) ||
+            (fu.Scheme != Uri.UriSchemeHttp && fu.Scheme != Uri.UriSchemeHttps))
+        {
+            return Results.Json(
+                new ChallengeAckResponse { Ok = false, Error = "url must be absolute http(s)." },
+                AppJsonContext.Default.ChallengeAckResponse,
+                statusCode: StatusCodes.Status400BadRequest);
+        }
+
+        files.Add(new ChallengeFileRef { FileId = "f1", Url = body.Url.Trim() });
+    }
+
+    if (files.Count == 0)
+    {
+        return Results.Json(
+            new ChallengeAckResponse
+            {
+                Ok = false,
+                Error =
+                    "Required: files[{fileId,url}] (competition shape), or legacy { url, dpi? }. " +
+                    "Optional: teamId, key, callbackUrl (ignored for sync).",
+            },
+            AppJsonContext.Default.ChallengeAckResponse,
+            statusCode: StatusCodes.Status400BadRequest);
+    }
+
+    int? dpi = body.Dpi;
     if (dpi is null &&
         httpRequest.Query.TryGetValue("dpi", out var dpiQuery) &&
         int.TryParse(dpiQuery.FirstOrDefault(), out int dpiFromQuery))
@@ -262,48 +313,62 @@ app.MapPost("/ocr", async Task<IResult> (
 
     dpi ??= config.DefaultDpi;
 
+    List<ChallengeFileResult> results = [];
     try
     {
-        ParallelPdfDownloader.DownloadResult download =
-            await downloader.DownloadAsync(url, ct).ConfigureAwait(false);
-        using (download.Buffer)
+        foreach (ChallengeFileRef file in files)
         {
-            OcrResponse response = await pipeline
-                .ProcessAsync(download.Buffer, download.ElapsedMs, download.Mode, ct, dpi)
-                .ConfigureAwait(false);
-            return Results.Json(response, AppJsonContext.Default.OcrResponse);
+            string fileId = file.FileId ?? "f1";
+            string url = file.Url!;
+            ParallelPdfDownloader.DownloadResult download =
+                await downloader.DownloadAsync(url, ct).ConfigureAwait(false);
+            using (download.Buffer)
+            {
+                OcrResponse ocr = await pipeline
+                    .ProcessAsync(download.Buffer, download.ElapsedMs, download.Mode, ct, dpi)
+                    .ConfigureAwait(false);
+                results.Add(ChallengeResultMapper.BuildFileResult(fileId, ocr));
+            }
         }
     }
     catch (ArgumentException ex)
     {
         return Results.Json(
-            new OcrResponse { Ok = false, Error = ex.Message },
-            AppJsonContext.Default.OcrResponse,
+            new ChallengeAckResponse { Ok = false, Error = ex.Message },
+            AppJsonContext.Default.ChallengeAckResponse,
             statusCode: StatusCodes.Status400BadRequest);
     }
     catch (HttpRequestException ex)
     {
-        logger.LogWarning(ex, "Download failed for {Url}", url);
+        logger.LogWarning(ex, "Debug /ocr download failed");
         return Results.Json(
-            new OcrResponse { Ok = false, Error = "Failed to download PDF: " + ex.Message },
-            AppJsonContext.Default.OcrResponse,
+            new ChallengeAckResponse { Ok = false, Error = "Failed to download PDF: " + ex.Message },
+            AppJsonContext.Default.ChallengeAckResponse,
             statusCode: StatusCodes.Status502BadGateway);
     }
     catch (InvalidOperationException ex)
     {
         return Results.Json(
-            new OcrResponse { Ok = false, Error = ex.Message },
-            AppJsonContext.Default.OcrResponse,
+            new ChallengeAckResponse { Ok = false, Error = ex.Message },
+            AppJsonContext.Default.ChallengeAckResponse,
             statusCode: StatusCodes.Status400BadRequest);
     }
     catch (Exception ex)
     {
-        logger.LogError(ex, "OCR pipeline failed for {Url}", url);
+        logger.LogError(ex, "Debug /ocr pipeline failed");
         return Results.Json(
-            new OcrResponse { Ok = false, Error = "OCR failed: " + ex.Message },
-            AppJsonContext.Default.OcrResponse,
+            new ChallengeAckResponse { Ok = false, Error = "OCR failed: " + ex.Message },
+            AppJsonContext.Default.ChallengeAckResponse,
             statusCode: StatusCodes.Status500InternalServerError);
     }
+
+    ChallengeCallbackBody callbackShaped = new()
+    {
+        TeamId = body.TeamId,
+        Key = string.IsNullOrWhiteSpace(body.Key) ? "debug" : body.Key.Trim(),
+        Result = results,
+    };
+    return Results.Json(callbackShaped, AppJsonContext.Default.ChallengeCallbackBody);
 });
 
 app.MapGet("/", () => Results.Text(
@@ -311,7 +376,9 @@ app.MapGet("/", () => Results.Text(
     "POST /challenge  ← competition serviceUrl (also POST /)\n" +
     "  {\"teamId\":123,\"key\":\"...\",\"callbackUrl\":\"https://...\",\"files\":[{\"fileId\":\"f1\",\"url\":\"https://...pdf\"}]}\n" +
     "  → HTTP 200 {\"ok\":true} immediately; results POSTed async to callbackUrl\n" +
-    "POST /ocr        debug sync OCR {\"url\":\"https://.../file.pdf\",\"dpi\":96}\n" +
+    "POST /ocr        debug sync OCR (competition shapes; response = callback body)\n" +
+    "  {\"teamId\":0,\"key\":\"debug\",\"files\":[{\"fileId\":\"f1\",\"url\":\"https://...pdf\"}]}\n" +
+    "  or legacy {\"url\":\"https://.../file.pdf\"} / ?dpi=96\n" +
     "GET  /health\n" +
     $"Config: {configPath}\n" +
     "Env OCR: MINIOCR_ENGINES MINIOCR_DPI MINIOCR_LINE_WORKERS MINIOCR_DET_THREADS MINIOCR_USE_CLS MINIOCR_RASTER_WORKERS\n" +

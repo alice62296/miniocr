@@ -32,11 +32,6 @@ jobs:
           - rid: linux-x64
             os: ubuntu-latest
             avx2: true
-          # macos-13 = Intel x64 runners (AVX2). If GitHub retires macos-13,
-          # remove this entry — do not cross-compile Native AOT from ARM.
-          - rid: osx-x64
-            os: macos-13
-            avx2: true
           # ARM64: no AVX2 (NEON baseline)
           - rid: osx-arm64
             os: macos-latest

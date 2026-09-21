@@ -1,9 +1,21 @@
 namespace MiniOcr.Models;
 
-public sealed class OcrUrlRequest
+/// <summary>
+/// Debug sync <c>POST /ocr</c> body. Prefer competition fields; legacy <see cref="Url"/> still maps to
+/// <c>files:[{fileId:"f1",url}]</c>. DPI may also come from query <c>?dpi=</c> or server config.
+/// </summary>
+public sealed class OcrDebugRequest
 {
+    public int TeamId { get; set; }
+    public string? Key { get; set; }
+    /// <summary>Ignored for sync debug (no callback); accepted for competition-shaped bodies.</summary>
+    public string? CallbackUrl { get; set; }
+    public List<ChallengeFileRef>? Files { get; set; }
+
+    /// <summary>Legacy single-URL debug field; mapped to fileId <c>f1</c> when <see cref="Files"/> is empty.</summary>
     public string? Url { get; set; }
-    /// <summary>Optional per-request raster DPI override (36–300). Defaults to server MINIOCR_DPI.</summary>
+
+    /// <summary>Optional per-request raster DPI override (36–300). Defaults to query/env/config.</summary>
     public int? Dpi { get; set; }
 }
 
@@ -38,6 +50,7 @@ public sealed class OcrEntities
     public List<EntityHit> Persons { get; set; } = [];
 }
 
+/// <summary>Internal OCR pipeline result (not the competition callback shape).</summary>
 public sealed class OcrResponse
 {
     public bool Ok { get; set; }
