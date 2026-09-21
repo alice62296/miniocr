@@ -235,6 +235,7 @@ cd artifacts/linux-x64-singlefile
     "maxConcurrency": 4,
     "ocrConcurrency": 32,
     "ocrMaxCharsHint": 8000,
+    "ocrJpegQuality": 70,
     "fallbackToHeuristics": true
   },
   "ocr": {
@@ -253,24 +254,26 @@ cd artifacts/linux-x64-singlefile
 **优先级：**
 
 - OCR：环境变量 `MINIOCR_*` **覆盖** 文件；文件中 `null` / 未写且 `autoScaleFromCpu: true` 时按 CPU 核数自动推算。`MINIOCR_OCR_MODE` 覆盖 `ocr.mode`。
-- LLM：主要读配置文件；可用 `MINIOCR_LLM_API_KEY` / `MINIOCR_LLM_BASE_URL` / `MINIOCR_LLM_MODEL` / `MINIOCR_LLM_MAX_CONCURRENCY` / `MINIOCR_LLM_OCR_CONCURRENCY` 覆盖。也可用 `MINIOCR_CONFIG_PATH` 指定配置文件。**不会**把 `apiKey` 打进日志（仅显示 `(set)` / `(empty)`）。
+- LLM：主要读配置文件；可用 `MINIOCR_LLM_API_KEY` / `MINIOCR_LLM_BASE_URL` / `MINIOCR_LLM_MODEL` / `MINIOCR_LLM_MAX_CONCURRENCY` / `MINIOCR_LLM_OCR_CONCURRENCY` / `MINIOCR_LLM_OCR_JPEG_QUALITY` 覆盖。也可用 `MINIOCR_CONFIG_PATH` 指定配置文件。**不会**把 `apiKey` 打进日志（仅显示 `(set)` / `(empty)`）。
 
 #### OCR 模式：`local` vs `llm`（视觉 OCR）
 
 | `ocr.mode` | 行为 | 何时用 |
 | --- | --- | --- |
 | `local`（默认） | 加载 ChineseV6Tiny / `PaddleOcrAll`；栅格后本地 OCR；可选 LLM **文本** NER | 离线、控成本、低延迟本机推理 |
-| `llm` | **不加载**本地 Paddle 模型（更快启动、更省 RAM）；栅格后每页 JPEG → 多模态 Chat Completions | 有视觉模型配额、希望直接出 B04/B06 |
+| `llm` | **不加载**本地 Paddle 模型（更快启动、更省 RAM）；栅格→JPEG→多模态 Chat Completions（与视觉 **流水线重叠**） | 有视觉模型配额、希望直接出 B04/B06 |
 
 设置方式：
 
 ```json
-"ocr": { "mode": "llm", "dpi": 96, ... }
+"ocr": { "mode": "llm" }
 ```
 
-或：`export MINIOCR_OCR_MODE=llm`。
+或：`export MINIOCR_OCR_MODE=llm`。未在配置/`MINIOCR_DPI` 中显式设置 DPI 时，`llm` 默认 **72**（`local` 仍为 **96**）；需要更高清晰度可设 `"dpi": 96` 或 `150`。
 
 **`llm` 模式要求** `llm.enabled` + 非空 `apiKey`（及 `baseUrl` / `model`）。若缺失，启动时会 **明确告警并回退到 `local`**，避免服务起不来。
+
+**为何不再有「下载后空等 ~30s」：** 旧实现会先把**全部页**栅格+JPEG 编码完才发第一张视觉请求。现在与 `local` 一样用有界 Channel：**每页** rasterize→JPEG 后立刻交给视觉 worker；位图不攒全本，JPEG 队列约 `2×ocrConcurrency`。日志会打出 `download done` → `first page JPEG ready` → `first vision request` 的相对时间戳，便于确认重叠。默认 `rasterWorkers=min(8,cores)`（视觉 I/O 时 CPU 留给 PDFium），`llm.ocrJpegQuality` 默认 **70**（可用 `MINIOCR_LLM_OCR_JPEG_QUALITY` 覆盖）。
 
 **视觉请求形态（OpenAI 兼容）：** `POST {baseUrl}/v1/chat/completions`，`messages` 含 `image_url`（`data:image/jpeg;base64,...`），提示词要求返回：
 
@@ -278,7 +281,7 @@ cd artifacts/linux-x64-singlefile
 {"text":"整页纯文本","ruleList":[{"ruleCode":"B04","ruleName":"人员名称","ruleItemList":[{"personName":"...","count":1,"originText":["10-100字摘录"]}]},{"ruleCode":"B06", "..."}]}
 ```
 
-页级并发：`llm.ocrConcurrency`（默认 **32**，范围 **1–256**），`Parallel.ForEachAsync`；环境变量 `MINIOCR_LLM_OCR_CONCURRENCY` 可覆盖。视觉调用是 **I/O 密集**，可远高于本地引擎数，但务必注意提供商 **RPM / TPM / 费用**（2000 页 × 高并发 ≈ 大量计费与 429 风险）。
+页级并发：`llm.ocrConcurrency`（默认 **32**，范围 **1–256**）；环境变量 `MINIOCR_LLM_OCR_CONCURRENCY` 可覆盖。视觉调用是 **I/O 密集**，可远高于本地引擎数，但务必注意提供商 **RPM / TPM / 费用**（2000 页 × 高并发 ≈ 大量计费与 429 风险）。
 
 **模型建议：**
 
@@ -302,7 +305,8 @@ cd artifacts/linux-x64-singlefile
 4. 或仅用环境变量：`export MINIOCR_LLM_API_KEY=sk-...`（其余仍可读文件）。
 5. **文本 NER 并发**：`llm.maxConcurrency`（默认 **4**，范围 1–32）用于 `local` 模式下的 Chat Completions 批次；`MINIOCR_LLM_MAX_CONCURRENCY` 可覆盖。
 6. **视觉 OCR 并发**：`llm.ocrConcurrency`（默认 **32**，1–256）；`MINIOCR_LLM_OCR_CONCURRENCY` 可覆盖。调高可缩短墙钟时间，但请留意 **费率与限流**。
-7. `local` 模式下 `enabled: false` 或没有 key 时：若 `fallbackToHeuristics: true`（默认）则用启发式 NER；否则 `entities` 为空。
+7. **视觉 JPEG 质量**：`llm.ocrJpegQuality`（默认 **70**，40–95）；`MINIOCR_LLM_OCR_JPEG_QUALITY` 可覆盖。
+8. `local` 模式下 `enabled: false` 或没有 key 时：若 `fallbackToHeuristics: true`（默认）则用启发式 NER；否则 `entities` 为空。
 
 ### 吞吐旋钮（文件 + 环境变量 / 请求）
 
@@ -310,12 +314,13 @@ cd artifacts/linux-x64-singlefile
 | --- | --- | ---: | --- |
 | `MINIOCR_OCR_MODE` | `ocr.mode` | **local** | `local`（Paddle）或 `llm`（视觉；跳过本地模型） |
 | `MINIOCR_LLM_OCR_CONCURRENCY` | `llm.ocrConcurrency` | **32**（1–256） | `ocr.mode=llm` 时页级视觉并发 |
+| `MINIOCR_LLM_OCR_JPEG_QUALITY` | `llm.ocrJpegQuality` | **70**（40–95） | `ocr.mode=llm` 时页图 JPEG 质量（更低=更快编码/更小上传） |
 | `MINIOCR_ENGINES` | `ocr.engines` | **4**（`Clamp(cores/2, 1, min(16,cores))`） | 页级并行 `PaddleOcrAll` 实例数（仅 local） |
-| `MINIOCR_DPI` | `ocr.dpi` | **96** | 栅格化 DPI（也可在 JSON/`?dpi=` 覆盖） |
+| `MINIOCR_DPI` | `ocr.dpi` | **96**（local）/ **72**（llm，未显式设置时） | 栅格化 DPI（也可在 JSON/`?dpi=` 覆盖） |
 | `MINIOCR_LINE_WORKERS` | `ocr.lineWorkers` | 自动 | 页内 CLS/REC 并行 |
 | `MINIOCR_DET_THREADS` | `ocr.detThreads` | 自动 | 检测图内卷积线程 |
 | `MINIOCR_USE_CLS` | `ocr.useCls` | **false** | 是否启用方向分类 |
-| `MINIOCR_RASTER_WORKERS` | `ocr.rasterWorkers` | 自动 | 并行 PDF 栅格生产者（封顶 8） |
+| `MINIOCR_RASTER_WORKERS` | `ocr.rasterWorkers` | 自动（llm：`min(8,cores)`） | 并行 PDF 栅格生产者（封顶 8） |
 | `MINIOCR_REC_BATCH` | — | **8** | `RecBatchLines` |
 | `MINIOCR_DET_LIMIT_SIDE` | — | **960** | 检测 `LimitSideLength` |
 
@@ -456,8 +461,8 @@ curl -sS http://127.0.0.1:5080/health
 | 环节 | 策略 |
 | --- | --- |
 | 下载 | `HttpClient`：若 `Accept-Ranges: bytes` 且已知 `Content-Length`，则并行 Range 写入预分配缓冲；否则单流写入预分配/可控增长缓冲。硬顶 **300 MB**。缓冲来自 `ArrayPool<byte>`。 |
-| 栅格化 | PDFtoImage（PDFium + SkiaSharp），默认 **96 DPI**；每 worker **一次** `PdfDocument.Load` + `ToImages`（避免逐页 `ToImage` 重载）；`AntiAliasing=None` + `Grayscale`（仍输出 BGRA）；多生产者写入有界 Channel（窗口 ≈ `2 ×` OCR 引擎数），**绝不**同时持有全部页位图。 |
-| OCR | **local**：复用多个 `PaddleOcrAll`（ChineseV6Tiny，默认可关 CLS）；页级引擎池互斥租用；`LineWorkerCount` / `DetIntraOpThreads` 做页内并行。Skia **BGRA** 直接喂 OCR。**llm**：不加载 Paddle；页图 JPEG base64 → 多模态 Chat Completions（`ocrConcurrency` 并行），优先直接产出 B04/B06 `ruleList`。 |
+| 栅格化 | PDFtoImage（PDFium + SkiaSharp）；**local** 默认 **96 DPI**，**llm** 未显式配置时默认 **72 DPI**；每 worker **一次** `PdfDocument.Load` + `ToImages`；`AntiAliasing=None` + `Grayscale`；多生产者写入有界 Channel，**绝不**同时持有全部页位图。llm 默认更多 raster workers（`min(8,cores)`）。 |
+| OCR | **local**：复用多个 `PaddleOcrAll`（ChineseV6Tiny，默认可关 CLS）；页级引擎池互斥租用；Channel 上 raster↔OCR 重叠。**llm**：不加载 Paddle；**每页** JPEG（质量默认 70）经有界队列立刻交给视觉 worker（`ocrConcurrency`），与栅格重叠——不再等全本编码完才发第一张；优先直接产出 B04/B06 `ruleList`。 |
 | 实体 | 优先 `LlmEntityExtractor`（Chat Completions 分批）；失败/关闭则 `EntityExtractor` 启发式。 |
 | JSON | 源生成 `AppJsonContext`，AOT 友好。 |
 

@@ -171,6 +171,14 @@ public static class AppConfigStore
 
         int ocrMaxChars = llm.OcrMaxCharsHint <= 0 ? 8000 : llm.OcrMaxCharsHint;
 
+        int ocrJpegQuality = llm.OcrJpegQuality <= 0 ? 70 : llm.OcrJpegQuality;
+        string? envJpegQ = Environment.GetEnvironmentVariable("MINIOCR_LLM_OCR_JPEG_QUALITY");
+        if (!string.IsNullOrWhiteSpace(envJpegQ) &&
+            int.TryParse(envJpegQ.Trim(), out int parsedJpegQ))
+        {
+            ocrJpegQuality = parsedJpegQ;
+        }
+
         return new LlmRuntimeConfig
         {
             Enabled = llm.Enabled,
@@ -183,6 +191,7 @@ public static class AppConfigStore
             MaxConcurrency = Math.Clamp(maxConcurrency, 1, 32),
             OcrConcurrency = Math.Clamp(ocrConcurrency, 1, 256),
             OcrMaxCharsHint = Math.Clamp(ocrMaxChars, 500, 100_000),
+            OcrJpegQuality = Math.Clamp(ocrJpegQuality, 40, 95),
             FallbackToHeuristics = llm.FallbackToHeuristics,
         };
     }
@@ -365,6 +374,7 @@ public static class AppConfigStore
             "maxConcurrency": 4,
             "ocrConcurrency": 32,
             "ocrMaxCharsHint": 8000,
+            "ocrJpegQuality": 70,
             "fallbackToHeuristics": true
           },
           "ocr": {

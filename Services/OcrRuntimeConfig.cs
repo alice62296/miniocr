@@ -67,20 +67,28 @@ public sealed class OcrRuntimeConfig
             forEngines.DetThreads);
         det = Math.Clamp(det, 1, 16);
 
-        int dpiFallback = ocr.Dpi ?? 96;
+        // local default 96; llm default 72 when dpi unset (vision is IO-bound; fewer pixels = faster encode/upload).
+        // Explicit ocr.dpi or MINIOCR_DPI always wins — do not change local's 96 when mode=local.
+        int dpiFallback = ocr.Dpi ?? (string.Equals(mode, "llm", StringComparison.OrdinalIgnoreCase) ? 72 : 96);
         int dpi = Math.Clamp(ReadInt("MINIOCR_DPI", dpiFallback), 36, 300);
 
         bool useClsFile = ocr.UseCls ?? false;
         bool useCls = ReadBool("MINIOCR_USE_CLS", useClsFile);
 
-        int rasterDefault = autoScale
-            ? forEngines.RasterWorkers
-            : Math.Clamp(Math.Min(engines, 4), 1, 8);
+        // Vision OCR is IO-bound: leave CPU free for PDFium — default raster workers = min(8, cores).
+        bool llmMode = string.Equals(mode, "llm", StringComparison.OrdinalIgnoreCase);
+        int rasterDefault;
+        if (llmMode)
+            rasterDefault = Math.Clamp(Math.Min(8, cores), 1, 8);
+        else if (autoScale)
+            rasterDefault = forEngines.RasterWorkers;
+        else
+            rasterDefault = Math.Clamp(Math.Min(engines, 4), 1, 8);
         int raster = ResolveInt(
             "MINIOCR_RASTER_WORKERS",
             ocr.RasterWorkers,
             rasterDefault,
-            autoScale,
+            autoScale || llmMode,
             rasterDefault);
         raster = Math.Clamp(raster, 1, 8);
 

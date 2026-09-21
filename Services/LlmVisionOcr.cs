@@ -52,9 +52,10 @@ public sealed partial class LlmVisionOcr
     public LlmRuntimeConfig Config => _config;
     public bool IsUsable => _config.IsUsable;
     public int OcrConcurrency => Math.Clamp(_config.OcrConcurrency, 1, 256);
+    public int OcrJpegQuality => Math.Clamp(_config.OcrJpegQuality, 40, 95);
 
-    /// <summary>Encode SKBitmap as JPEG bytes (quality 85). Caller disposes bitmap.</summary>
-    public static byte[] EncodeJpeg(SKBitmap bitmap, int quality = 85)
+    /// <summary>Encode SKBitmap as JPEG bytes. Caller disposes bitmap.</summary>
+    public static byte[] EncodeJpeg(SKBitmap bitmap, int quality = 70)
     {
         using SKImage image = SKImage.FromBitmap(bitmap);
         using SKData data = image.Encode(SKEncodedImageFormat.Jpeg, Math.Clamp(quality, 40, 95));

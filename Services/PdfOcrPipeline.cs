@@ -111,9 +111,11 @@ public sealed class PdfOcrPipeline
         CancellationToken ct)
     {
         RenderOptions renderOptions = CreateRenderOptions(dpi);
+        int concurrency = _vision!.OcrConcurrency;
+        int jpegQuality = _vision.OcrJpegQuality;
 
-        // Phase 1: parallel rasterize → JPEG (dispose bitmaps immediately; keep memory low).
-        PageJpeg[] images = new PageJpeg[pageCount];
+        // Overlap raster→encode→vision (same idea as local Channel pipeline).
+        // Do NOT wait for all pages before first RecognizePageAsync.
         Channel<(int Index, SKBitmap Bitmap, double RasterMs)> rasterized =
             Channel.CreateBounded<(int, SKBitmap, double)>(new BoundedChannelOptions(_pageWindow)
             {
@@ -122,8 +124,39 @@ public sealed class PdfOcrPipeline
                 FullMode = BoundedChannelFullMode.Wait,
             });
 
+        // Bounded JPEG queue: ~2× vision concurrency (or pageWindow), never hold all page JPEGs.
+        int jpegCapacity = Math.Min(
+            Math.Max(1, pageCount),
+            Math.Max(2, Math.Max(_pageWindow, concurrency * 2)));
+        Channel<PageJpeg> jpegs = Channel.CreateBounded<PageJpeg>(new BoundedChannelOptions(jpegCapacity)
+        {
+            SingleWriter = false,
+            SingleReader = false,
+            FullMode = BoundedChannelFullMode.Wait,
+        });
+
+        OcrPageResult[] pages = new OcrPageResult[pageCount];
         double rasterTotal = 0;
+        double ocrTotal = 0;
         object timingLock = new();
+        int firstJpegFlag = 0;
+        int firstVisionFlag = 0;
+
+        // Wall clock from download handoff → first JPEG / first vision (overlap proof).
+        Stopwatch sinceDownload = Stopwatch.StartNew();
+        _logger.LogInformation(
+            "Vision pipeline: download done (mode={Mode}, downloadMs={DownloadMs:F1}); " +
+            "starting overlapped raster+encode→vision; pages={Pages}, dpi={Dpi}, " +
+            "jpegQuality={JpegQ}, rasterWorkers={Raster}, ocrConcurrency={Conc}, " +
+            "jpegQueueCapacity={JpegCap}",
+            downloadMode,
+            downloadMs,
+            pageCount,
+            dpi,
+            jpegQuality,
+            _rasterWorkers,
+            concurrency,
+            jpegCapacity);
 
         Task producer = ProduceParallelAsync(
             pdfBytes, pdfByteCount, pageCount, renderOptions, rasterized.Writer, ct);
@@ -137,55 +170,93 @@ public sealed class PdfOcrPipeline
                 {
                     int width = bitmap.Width;
                     int height = bitmap.Height;
-                    byte[] jpeg = LlmVisionOcr.EncodeJpeg(bitmap);
-                    images[index] = new PageJpeg(index, width, height, jpeg, rasterMs);
+                    byte[] jpeg = LlmVisionOcr.EncodeJpeg(bitmap, jpegQuality);
+                    PageJpeg item = new(index, width, height, jpeg, rasterMs);
                     lock (timingLock)
                         rasterTotal += rasterMs;
+
+                    if (Interlocked.CompareExchange(ref firstJpegFlag, 1, 0) == 0)
+                    {
+                        _logger.LogInformation(
+                            "Vision pipeline: first page JPEG ready (page={Page}, {W}x{H}, jpegBytes={Bytes}) " +
+                            "at t+{Elapsed:F0}ms after download handoff",
+                            index + 1,
+                            width,
+                            height,
+                            jpeg.Length,
+                            sinceDownload.Elapsed.TotalMilliseconds);
+                    }
+
+                    await jpegs.Writer.WriteAsync(item, ct).ConfigureAwait(false);
                 }
             }
         }
 
-        // A few encoders is enough; vision I/O concurrency comes later.
-        int encodeWorkers = Math.Clamp(_rasterWorkers, 1, 4);
-        Task[] encoders = Enumerable.Range(0, encodeWorkers)
-            .Select(_ => EncodeConsumerAsync())
-            .ToArray();
-
-        await producer.ConfigureAwait(false);
-        await Task.WhenAll(encoders).ConfigureAwait(false);
-
-        for (int i = 0; i < pageCount; i++)
+        async Task VisionConsumerAsync()
         {
-            if (images[i].Jpeg is null)
-                throw new InvalidOperationException($"Missing rasterized page index {i}.");
-        }
-
-        // Phase 2: high-concurrency vision OCR (I/O bound).
-        OcrPageResult[] pages = new OcrPageResult[pageCount];
-        double ocrTotal = 0;
-        int concurrency = _vision!.OcrConcurrency;
-
-        await Parallel.ForEachAsync(
-            images,
-            new ParallelOptions
+            await foreach (PageJpeg img in jpegs.Reader.ReadAllAsync(ct).ConfigureAwait(false))
             {
-                MaxDegreeOfParallelism = concurrency,
-                CancellationToken = ct,
-            },
-            async (img, token) =>
-            {
+                if (img.Jpeg is null)
+                    continue;
+
+                if (Interlocked.CompareExchange(ref firstVisionFlag, 1, 0) == 0)
+                {
+                    _logger.LogInformation(
+                        "Vision pipeline: first vision request (page={Page}) " +
+                        "at t+{Elapsed:F0}ms after download handoff (overlap vs waiting for all pages)",
+                        img.Index + 1,
+                        sinceDownload.Elapsed.TotalMilliseconds);
+                }
+
                 OcrPageResult page = await _vision
-                    .RecognizePageAsync(img.Index + 1, img.Width, img.Height, img.Jpeg!, img.RasterMs, token)
+                    .RecognizePageAsync(img.Index + 1, img.Width, img.Height, img.Jpeg, img.RasterMs, ct)
                     .ConfigureAwait(false);
                 pages[img.Index] = page;
                 lock (timingLock)
                     ocrTotal += page.OcrMs;
-            }).ConfigureAwait(false);
+            }
+        }
+
+        // Encode is CPU; scale with raster workers (vision is IO so CPU free for PDFium+JPEG).
+        int encodeWorkers = Math.Clamp(_rasterWorkers, 1, 8);
+        Task[] encoders = Enumerable.Range(0, encodeWorkers)
+            .Select(_ => EncodeConsumerAsync())
+            .ToArray();
+
+        int visionWorkers = Math.Clamp(concurrency, 1, Math.Max(1, pageCount));
+        Task[] visionTasks = Enumerable.Range(0, visionWorkers)
+            .Select(_ => VisionConsumerAsync())
+            .ToArray();
+
+        try
+        {
+            await producer.ConfigureAwait(false);
+            await Task.WhenAll(encoders).ConfigureAwait(false);
+        }
+        finally
+        {
+            jpegs.Writer.TryComplete();
+        }
+
+        await Task.WhenAll(visionTasks).ConfigureAwait(false);
+
+        for (int i = 0; i < pageCount; i++)
+        {
+            if (pages[i] is null)
+                throw new InvalidOperationException($"Missing vision OCR result for page index {i}.");
+        }
 
         // Entities derived from vision ruleList (for any consumer of OcrResponse.Entities).
         OcrEntities entities = EntitiesFromVisionPages(pages);
 
         totalSw.Stop();
+
+        _logger.LogInformation(
+            "Vision pipeline done: firstJpegLogged={FirstJpeg}, firstVisionLogged={FirstVision}, " +
+            "totalMs={Total:F1}",
+            firstJpegFlag == 1,
+            firstVisionFlag == 1,
+            totalSw.Elapsed.TotalMilliseconds);
 
         return new OcrResponse
         {

@@ -62,6 +62,7 @@ Console.WriteLine(
     $"LLM: enabled={llmConfig.Enabled}, usable={llmConfig.IsUsable}, " +
     $"model={llmConfig.Model}, baseUrl={llmConfig.BaseUrl}, " +
     $"maxConcurrency={llmConfig.MaxConcurrency}, ocrConcurrency={llmConfig.OcrConcurrency}, " +
+    $"ocrJpegQuality={llmConfig.OcrJpegQuality}, " +
     $"fallbackToHeuristics={llmConfig.FallbackToHeuristics}, apiKey={apiKeyStatus}");
 
 OcrEngine? engine = null;

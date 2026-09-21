@@ -21,6 +21,8 @@ public sealed class LlmFileConfig
     public int OcrConcurrency { get; set; } = 32;
     /// <summary>Hint for max chars of page text the vision model should return.</summary>
     public int OcrMaxCharsHint { get; set; } = 8000;
+    /// <summary>JPEG encode quality for vision OCR pages (clamped 40–95). Default 70.</summary>
+    public int OcrJpegQuality { get; set; } = 70;
     public bool FallbackToHeuristics { get; set; } = true;
 }
 
@@ -49,6 +51,8 @@ public sealed class LlmRuntimeConfig
     public int MaxConcurrency { get; init; } = 4;
     public int OcrConcurrency { get; init; } = 32;
     public int OcrMaxCharsHint { get; init; } = 8000;
+    /// <summary>JPEG quality for vision page images (40–95). Default 70.</summary>
+    public int OcrJpegQuality { get; init; } = 70;
     public bool FallbackToHeuristics { get; init; } = true;
 
     public bool IsUsable =>
