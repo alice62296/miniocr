@@ -27,6 +27,8 @@ public sealed class OcrPageResult
     public string Text { get; set; } = "";
     public double RasterizeMs { get; set; }
     public double OcrMs { get; set; }
+    /// <summary>Optional prebuilt contest rules (vision OCR). When set, mapper prefers these.</summary>
+    public List<ChallengeRule>? RuleList { get; set; }
 }
 
 public sealed class OcrTimings
@@ -82,6 +84,8 @@ public sealed class HealthResponse
     public string ConfigPath { get; set; } = "";
     public bool ConfigFileExisted { get; set; }
     public string ConfigPathSource { get; set; } = "";
+    public string OcrMode { get; set; } = "local";
+    public int LlmOcrConcurrency { get; set; }
     public bool LlmEnabled { get; set; }
     public bool LlmUsable { get; set; }
     public string LlmModel { get; set; } = "";

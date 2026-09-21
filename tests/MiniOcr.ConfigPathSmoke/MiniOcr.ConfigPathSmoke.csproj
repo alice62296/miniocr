@@ -11,6 +11,7 @@
   <ItemGroup>
     <Compile Include="..\..\Services\AppConfigStore.cs" Link="AppConfigStore.cs" />
     <Compile Include="..\..\Models\AppConfigModels.cs" Link="AppConfigModels.cs" />
+    <Compile Include="..\..\Models\ChallengeModels.cs" Link="ChallengeModels.cs" />
   </ItemGroup>
   <ItemGroup>
     <FrameworkReference Include="Microsoft.AspNetCore.App" />

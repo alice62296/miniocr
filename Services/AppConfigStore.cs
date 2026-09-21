@@ -161,6 +161,16 @@ public static class AppConfigStore
             maxConcurrency = parsedConcurrency;
         }
 
+        int ocrConcurrency = llm.OcrConcurrency <= 0 ? 32 : llm.OcrConcurrency;
+        string? envOcrConcurrency = Environment.GetEnvironmentVariable("MINIOCR_LLM_OCR_CONCURRENCY");
+        if (!string.IsNullOrWhiteSpace(envOcrConcurrency) &&
+            int.TryParse(envOcrConcurrency.Trim(), out int parsedOcrConcurrency))
+        {
+            ocrConcurrency = parsedOcrConcurrency;
+        }
+
+        int ocrMaxChars = llm.OcrMaxCharsHint <= 0 ? 8000 : llm.OcrMaxCharsHint;
+
         return new LlmRuntimeConfig
         {
             Enabled = llm.Enabled,
@@ -171,6 +181,8 @@ public static class AppConfigStore
             MaxCharsPerRequest = Math.Clamp(
                 llm.MaxCharsPerRequest <= 0 ? 12000 : llm.MaxCharsPerRequest, 1000, 200_000),
             MaxConcurrency = Math.Clamp(maxConcurrency, 1, 32),
+            OcrConcurrency = Math.Clamp(ocrConcurrency, 1, 256),
+            OcrMaxCharsHint = Math.Clamp(ocrMaxChars, 500, 100_000),
             FallbackToHeuristics = llm.FallbackToHeuristics,
         };
     }
@@ -351,9 +363,12 @@ public static class AppConfigStore
             "timeoutSeconds": 120,
             "maxCharsPerRequest": 12000,
             "maxConcurrency": 4,
+            "ocrConcurrency": 32,
+            "ocrMaxCharsHint": 8000,
             "fallbackToHeuristics": true
           },
           "ocr": {
+            "mode": "local",
             "dpi": 96,
             "engines": null,
             "lineWorkers": null,

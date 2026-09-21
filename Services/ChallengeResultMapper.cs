@@ -13,6 +13,24 @@ public static class ChallengeResultMapper
 
     public static ChallengeFileResult BuildFileResult(string fileId, OcrResponse ocr)
     {
+        // Vision OCR may already attach contest-shaped ruleList per page.
+        if (ocr.Pages.Any(p => p.RuleList is { Count: > 0 }))
+        {
+            List<ChallengePageResult> pages = new(ocr.Pages.Count);
+            foreach (OcrPageResult page in ocr.Pages)
+            {
+                pages.Add(new ChallengePageResult
+                {
+                    Page = page.Page,
+                    RuleList = page.RuleList is { Count: > 0 }
+                        ? page.RuleList
+                        : [],
+                });
+            }
+
+            return new ChallengeFileResult { FileId = fileId, Pages = pages };
+        }
+
         OcrEntities entities = ocr.Entities ?? new OcrEntities();
         List<string> companies = entities.Companies.Select(c => c.Name).Where(n => n.Length > 0).ToList();
         List<string> persons = entities.Persons.Select(p => p.Name).Where(n => n.Length > 0).ToList();

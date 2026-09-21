@@ -36,7 +36,17 @@ string configPath = configLoad.ConfigPath;
 bool configFileExisted = configLoad.ConfigFileExisted;
 LlmRuntimeConfig llmConfig = AppConfigStore.ResolveLlm(appConfig);
 OcrRuntimeConfig runtimeConfig = OcrRuntimeConfig.FromAppConfig(appConfig);
+
+// ocr.mode=llm needs a usable LLM; otherwise fall back to local with a clear warning.
+if (runtimeConfig.IsLlmMode && !llmConfig.IsUsable)
+{
+    bootstrapLogger.LogWarning(
+        "ocr.mode=llm but LLM is not usable (need llm.enabled + apiKey + baseUrl + model); falling back to local Paddle OCR");
+    runtimeConfig = runtimeConfig.WithMode("local");
+}
+
 string apiKeyStatus = string.IsNullOrEmpty(llmConfig.ApiKey) ? "(empty)" : "(set)";
+bool llmOcrMode = runtimeConfig.IsLlmMode;
 
 Console.WriteLine($"Runtime: {RuntimeInformation.FrameworkDescription}");
 Console.WriteLine($"OS: {RuntimeInformation.OSDescription} ({RuntimeInformation.OSArchitecture})");
@@ -45,22 +55,32 @@ Console.WriteLine(
 Console.WriteLine(
     $"CPU auto-scale: ProcessorCount={runtimeConfig.ProcessorCount}, autoScaleFromCpu={runtimeConfig.AutoScaleFromCpu}");
 Console.WriteLine(
-    $"OCR knobs: engines={runtimeConfig.EngineCount}, dpi={runtimeConfig.DefaultDpi}, " +
+    $"OCR mode={runtimeConfig.Mode}, knobs: engines={runtimeConfig.EngineCount}, dpi={runtimeConfig.DefaultDpi}, " +
     $"lineWorkers={runtimeConfig.LineWorkerCount}, detThreads={runtimeConfig.DetIntraOpThreads}, " +
     $"useCls={runtimeConfig.UseDirectionClassification}, rasterWorkers={runtimeConfig.RasterWorkerCount}");
 Console.WriteLine(
-    $"LLM NER: enabled={llmConfig.Enabled}, usable={llmConfig.IsUsable}, " +
+    $"LLM: enabled={llmConfig.Enabled}, usable={llmConfig.IsUsable}, " +
     $"model={llmConfig.Model}, baseUrl={llmConfig.BaseUrl}, " +
-    $"maxConcurrency={llmConfig.MaxConcurrency}, " +
+    $"maxConcurrency={llmConfig.MaxConcurrency}, ocrConcurrency={llmConfig.OcrConcurrency}, " +
     $"fallbackToHeuristics={llmConfig.FallbackToHeuristics}, apiKey={apiKeyStatus}");
-Console.WriteLine("Loading ChineseV6Tiny OCR models...");
 
-OcrEngine engine = await OcrEngine.CreateAsync(
-    bootstrapLogs.CreateLogger<OcrEngine>(),
-    runtimeConfig);
+OcrEngine? engine = null;
+if (llmOcrMode)
+{
+    Console.WriteLine("Skipping ChineseV6Tiny / PaddleOcrAll — ocr.mode=llm (vision OCR).");
+}
+else
+{
+    Console.WriteLine("Loading ChineseV6Tiny OCR models...");
+    engine = await OcrEngine.CreateAsync(
+        bootstrapLogs.CreateLogger<OcrEngine>(),
+        runtimeConfig);
+}
+
 builder.Services.AddSingleton(runtimeConfig);
 builder.Services.AddSingleton(llmConfig);
-builder.Services.AddSingleton(engine);
+if (engine is not null)
+    builder.Services.AddSingleton(engine);
 
 builder.Services.AddHttpClient(nameof(LlmEntityExtractor), (sp, client) =>
 {
@@ -78,7 +98,32 @@ builder.Services.AddSingleton<LlmEntityExtractor>(sp =>
         sp.GetRequiredService<ILogger<LlmEntityExtractor>>());
 });
 
-builder.Services.AddSingleton<PdfOcrPipeline>();
+builder.Services.AddHttpClient(nameof(LlmVisionOcr), (sp, client) =>
+{
+    LlmRuntimeConfig cfg = sp.GetRequiredService<LlmRuntimeConfig>();
+    client.Timeout = TimeSpan.FromSeconds(cfg.TimeoutSeconds);
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("MiniOcr/1.0 (+LLM-vision-OCR)");
+});
+builder.Services.AddSingleton<LlmVisionOcr>(sp =>
+{
+    IHttpClientFactory factory = sp.GetRequiredService<IHttpClientFactory>();
+    HttpClient http = factory.CreateClient(nameof(LlmVisionOcr));
+    return new LlmVisionOcr(
+        http,
+        sp.GetRequiredService<LlmRuntimeConfig>(),
+        sp.GetRequiredService<ILogger<LlmVisionOcr>>());
+});
+
+builder.Services.AddSingleton<PdfOcrPipeline>(sp =>
+{
+    OcrRuntimeConfig cfg = sp.GetRequiredService<OcrRuntimeConfig>();
+    return new PdfOcrPipeline(
+        cfg,
+        sp.GetRequiredService<ILogger<PdfOcrPipeline>>(),
+        engine: sp.GetService<OcrEngine>(),
+        llm: sp.GetService<LlmEntityExtractor>(),
+        vision: sp.GetService<LlmVisionOcr>());
+});
 builder.Services.AddSingleton<ChallengeJobService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<ChallengeJobService>());
 
@@ -88,36 +133,45 @@ ILogger logger = app.Logger;
 IHostApplicationLifetime lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
 lifetime.ApplicationStopping.Register(() =>
 {
-    engine.DisposeAsync().AsTask().GetAwaiter().GetResult();
+    if (engine is not null)
+        engine.DisposeAsync().AsTask().GetAwaiter().GetResult();
 });
 
-app.MapGet("/health", (OcrEngine ocr, LlmRuntimeConfig llm, OcrRuntimeConfig cfg) => Results.Json(
-    new HealthResponse
-    {
-        Status = "ok",
-        ModelsLoaded = ocr.IsLoaded,
-        Runtime = RuntimeInformation.FrameworkDescription,
-        ProcessorCount = cfg.ProcessorCount,
-        EngineCount = ocr.EngineCount,
-        LineWorkerCount = ocr.LineWorkerCount,
-        DetIntraOpThreads = ocr.DetIntraOpThreads,
-        DefaultDpi = ocr.Config.DefaultDpi,
-        UseDirectionClassification = ocr.UseDirectionClassification,
-        RasterWorkerCount = ocr.Config.RasterWorkerCount,
-        RecBatchLines = ocr.Config.RecBatchLines,
-        DetLimitSideLength = ocr.Config.DetLimitSideLength,
-        AutoScaleFromCpu = cfg.AutoScaleFromCpu,
-        ConfigPath = configPath,
-        ConfigFileExisted = configFileExisted,
-        ConfigPathSource = configLoad.PathSource,
-        LlmEnabled = llm.Enabled,
-        LlmUsable = llm.IsUsable,
-        LlmModel = llm.Model,
-        LlmBaseUrl = llm.BaseUrl,
-        LlmFallbackToHeuristics = llm.FallbackToHeuristics,
-        LlmApiKey = apiKeyStatus,
-    },
-    AppJsonContext.Default.HealthResponse));
+app.MapGet("/health", (IServiceProvider sp) =>
+{
+    OcrEngine? ocr = sp.GetService<OcrEngine>();
+    LlmRuntimeConfig llm = sp.GetRequiredService<LlmRuntimeConfig>();
+    OcrRuntimeConfig cfg = sp.GetRequiredService<OcrRuntimeConfig>();
+    return Results.Json(
+        new HealthResponse
+        {
+            Status = "ok",
+            ModelsLoaded = ocr?.IsLoaded ?? false,
+            Runtime = RuntimeInformation.FrameworkDescription,
+            ProcessorCount = cfg.ProcessorCount,
+            EngineCount = ocr?.EngineCount ?? 0,
+            LineWorkerCount = ocr?.LineWorkerCount ?? 0,
+            DetIntraOpThreads = ocr?.DetIntraOpThreads ?? 0,
+            DefaultDpi = cfg.DefaultDpi,
+            UseDirectionClassification = cfg.UseDirectionClassification,
+            RasterWorkerCount = cfg.RasterWorkerCount,
+            RecBatchLines = cfg.RecBatchLines,
+            DetLimitSideLength = cfg.DetLimitSideLength,
+            AutoScaleFromCpu = cfg.AutoScaleFromCpu,
+            ConfigPath = configPath,
+            ConfigFileExisted = configFileExisted,
+            ConfigPathSource = configLoad.PathSource,
+            OcrMode = cfg.Mode,
+            LlmOcrConcurrency = llm.OcrConcurrency,
+            LlmEnabled = llm.Enabled,
+            LlmUsable = llm.IsUsable,
+            LlmModel = llm.Model,
+            LlmBaseUrl = llm.BaseUrl,
+            LlmFallbackToHeuristics = llm.FallbackToHeuristics,
+            LlmApiKey = apiKeyStatus,
+        },
+        AppJsonContext.Default.HealthResponse);
+});
 
 async Task<IResult> HandleChallengeAsync(
     HttpRequest httpRequest,
@@ -387,23 +441,26 @@ app.MapGet("/", () => Results.Text(
     "  {\"teamId\":0,\"key\":\"debug\",\"files\":[{\"fileId\":\"f1\",\"url\":\"https://...pdf\"}]}\n" +
     "  or legacy {\"url\":\"https://.../file.pdf\"} / ?dpi=96\n" +
     "GET  /health\n" +
-    $"Config: path={configPath} existed={configFileExisted} source={configLoad.PathSource} llm.usable={llmConfig.IsUsable} apiKey={apiKeyStatus}\n" +
+    $"Config: path={configPath} existed={configFileExisted} source={configLoad.PathSource} " +
+    $"ocr.mode={runtimeConfig.Mode} llm.usable={llmConfig.IsUsable} apiKey={apiKeyStatus}\n" +
     "Env CONFIG: MINIOCR_CONFIG_PATH\n" +
-    "Env OCR: MINIOCR_ENGINES MINIOCR_DPI MINIOCR_LINE_WORKERS MINIOCR_DET_THREADS MINIOCR_USE_CLS MINIOCR_RASTER_WORKERS\n" +
-    "Env LLM: MINIOCR_LLM_API_KEY MINIOCR_LLM_BASE_URL MINIOCR_LLM_MODEL MINIOCR_LLM_MAX_CONCURRENCY\n",
+    "Env OCR: MINIOCR_OCR_MODE MINIOCR_ENGINES MINIOCR_DPI MINIOCR_LINE_WORKERS MINIOCR_DET_THREADS MINIOCR_USE_CLS MINIOCR_RASTER_WORKERS\n" +
+    "Env LLM: MINIOCR_LLM_API_KEY MINIOCR_LLM_BASE_URL MINIOCR_LLM_MODEL MINIOCR_LLM_MAX_CONCURRENCY MINIOCR_LLM_OCR_CONCURRENCY\n",
     "text/plain; charset=utf-8"));
 
 string urls = string.Join(", ", app.Urls.DefaultIfEmpty("(default http://localhost:5000)"));
 logger.LogInformation(
-    "MiniOcr ready — ProcessorCount={Cores}, engines={Engines}, lineWorkers={LineWorkers}, det={Det}, raster={Raster}, dpi={Dpi}, useCls={UseCls}, llmUsable={Llm}, listening={Urls}",
+    "MiniOcr ready — mode={Mode}, ProcessorCount={Cores}, engines={Engines}, lineWorkers={LineWorkers}, det={Det}, raster={Raster}, dpi={Dpi}, useCls={UseCls}, llmUsable={Llm}, ocrConcurrency={OcrConc}, listening={Urls}",
+    runtimeConfig.Mode,
     runtimeConfig.ProcessorCount,
-    engine.EngineCount,
-    engine.LineWorkerCount,
-    engine.DetIntraOpThreads,
-    engine.Config.RasterWorkerCount,
-    engine.Config.DefaultDpi,
-    engine.UseDirectionClassification,
+    engine?.EngineCount ?? 0,
+    engine?.LineWorkerCount ?? 0,
+    engine?.DetIntraOpThreads ?? 0,
+    runtimeConfig.RasterWorkerCount,
+    runtimeConfig.DefaultDpi,
+    runtimeConfig.UseDirectionClassification,
     llmConfig.IsUsable,
+    llmConfig.OcrConcurrency,
     urls);
 
 await app.RunAsync();

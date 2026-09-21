@@ -9,6 +9,8 @@ namespace MiniOcr.Services;
 /// </summary>
 public sealed class OcrRuntimeConfig
 {
+    /// <summary><c>local</c> (Paddle) or <c>llm</c> (vision). Default local.</summary>
+    public string Mode { get; init; } = "local";
     public int EngineCount { get; init; }
     public int DefaultDpi { get; init; }
     public int LineWorkerCount { get; init; }
@@ -33,6 +35,7 @@ public sealed class OcrRuntimeConfig
         int cores = Math.Max(1, Environment.ProcessorCount);
         OcrFileConfig ocr = file.Ocr ?? new OcrFileConfig();
         bool autoScale = ocr.AutoScaleFromCpu;
+        string mode = ResolveMode(ocr.Mode);
 
         AutoScaleDefaults scaled = ComputeAutoScale(cores);
 
@@ -86,6 +89,7 @@ public sealed class OcrRuntimeConfig
 
         return new OcrRuntimeConfig
         {
+            Mode = mode,
             EngineCount = engines,
             DefaultDpi = dpi,
             LineWorkerCount = line,
@@ -162,6 +166,38 @@ public sealed class OcrRuntimeConfig
         if (fileValue is int fv)
             return fv;
         return autoScale ? autoDefault : fixedFallback;
+    }
+
+    /// <summary>Copy with a different OCR mode (e.g. llm→local fallback).</summary>
+    public OcrRuntimeConfig WithMode(string mode) => new()
+    {
+        Mode = ResolveMode(mode),
+        EngineCount = EngineCount,
+        DefaultDpi = DefaultDpi,
+        LineWorkerCount = LineWorkerCount,
+        DetIntraOpThreads = DetIntraOpThreads,
+        UseDirectionClassification = UseDirectionClassification,
+        RasterWorkerCount = RasterWorkerCount,
+        RecBatchLines = RecBatchLines,
+        DetLimitSideLength = DetLimitSideLength,
+        AutoScaleFromCpu = AutoScaleFromCpu,
+        ProcessorCount = ProcessorCount,
+    };
+
+    public bool IsLlmMode =>
+        string.Equals(Mode, "llm", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Env MINIOCR_OCR_MODE overrides file. Accepts local|llm (case-insensitive).
+    /// Unknown values fall back to local.
+    /// </summary>
+    public static string ResolveMode(string? fileMode)
+    {
+        string? env = Environment.GetEnvironmentVariable("MINIOCR_OCR_MODE");
+        string raw = !string.IsNullOrWhiteSpace(env) ? env.Trim() : (fileMode ?? "local");
+        if (string.Equals(raw, "llm", StringComparison.OrdinalIgnoreCase))
+            return "llm";
+        return "local";
     }
 
     private static int ReadInt(string name, int fallback)
