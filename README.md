@@ -134,7 +134,7 @@ export PATH="$HOME/.dotnet:$PATH"
 dotnet --list-sdks
 ```
 
-## AOT 发布（关键）
+## AOT 发布（关键，竞赛默认）
 
 ```bash
 git clone https://github.com/huiyuanai709/miniocr.git
@@ -142,7 +142,22 @@ cd miniocr
 dotnet publish -c Release -r linux-x64 -o ./artifacts/linux-x64
 ```
 
-产物：`./artifacts/linux-x64/MiniOcr`（单文件原生可执行程序 + 原生依赖如 `libSkiaSharp.so` / `libpdfium.so`）。
+产物目录示例：
+
+| 文件 | 说明 |
+| --- | --- |
+| `MiniOcr` | Native AOT 可执行文件（linux-x64 约 ~25–26 MB） |
+| `libSkiaSharp.so` | Skia 原生库（约 ~12 MB；Windows/macOS 为 `.dll` / `.dylib`） |
+| `libpdfium.so` | PDFium 原生库（约 ~7 MB；同理换后缀） |
+
+**这不是「一个文件就能跑」。** 必须把可执行文件与同目录下的原生库一起分发；缺 `.so` / `.dll` / `.dylib` 会在栅格化/位图阶段失败。
+
+### 为什么 AOT 做不到真正单文件？
+
+- Native AOT 产出的是**原生可执行文件**，通过动态加载（P/Invoke）调用 SkiaSharp / PDFium 的共享库。
+- `PublishSingleFile` + `IncludeNativeLibrariesForSelfExtract` **只对非 AOT** 生效；与 `PublishAot=true` 同时设置时会被**静默忽略**（[dotnet/runtime#117986](https://github.com/dotnet/runtime/discussions/117986)、[dotnet/sdk#49995](https://github.com/dotnet/sdk/issues/49995)），`.so` 仍会落在 exe 旁。
+- 把原生库**静态链接**进 AOT 二进制需要平台对应的 `.a` / `.lib` 静态库 + `DirectPInvoke` / `NativeLibrary` 配置。官方 SkiaSharp / PDFtoImage NuGet **不提供** Linux/Windows 桌面静态包（仅 WASM 等场景有静态资产），自行编译 Skia + PDFium 静态库超出本仓库范围。
+- 因此：**竞赛默认 = AOT 速度（AVX2 on x64）+ 旁路原生库**；需要「拷一个文件就能跑」请用下方可选单文件模式（非 AOT）。
 
 ### 运行 AOT 二进制
 
@@ -156,6 +171,32 @@ cd artifacts/linux-x64
 ```bash
 dotnet run -c Release --urls http://127.0.0.1:5080
 ```
+
+## 可选：真正单文件包（非 AOT）
+
+若只想分发**一个**可执行文件（首次运行会把原生库解压到 `$HOME/.net/MiniOcr/<hash>/`），使用属性 `MiniOcrSingleFile=true`（内部关闭 AOT，打开 `PublishSingleFile` + `IncludeNativeLibrariesForSelfExtract` + 压缩）：
+
+```bash
+dotnet publish -c Release -r linux-x64 -o ./artifacts/linux-x64-singlefile \
+  -p:MiniOcrSingleFile=true
+```
+
+| 项 | AOT（默认） | 单文件（`MiniOcrSingleFile=true`） |
+| --- | --- | --- |
+| 分发形态 | `MiniOcr` + `libSkiaSharp.*` + `libpdfium.*` | **仅** `MiniOcr` 一个文件 |
+| 体积（linux-x64，本机实测） | exe ~26 MB + so ~19 MB | 压缩后约 **~29 MB** |
+| 运行时 | Native AOT | 自包含 JIT（.NET 11） |
+| x64 AVX2 / 竞赛吞吐 | **是（默认保留）** | 否（不走 ILC；勿作竞赛主包） |
+| 首次启动 | 直接跑 | 解压原生库到 `~/.net/MiniOcr/` |
+
+运行：
+
+```bash
+cd artifacts/linux-x64-singlefile
+./MiniOcr --urls http://0.0.0.0:5080
+```
+
+本机冒烟（2026-09-21 CST）：把单独的 `MiniOcr` 拷到空目录启动 → `GET /health` 200 → `POST /ocr` 5 页样例约 1.4 s 返回竞赛形状 JSON；目录旁**无** `.so`。
 
 ### 配置文件（%APPDATA% / ApplicationData）
 
@@ -346,12 +387,14 @@ curl -sS http://127.0.0.1:5080/health
 
 1. 打开仓库 **Actions** → 选中 **Publish Native AOT** 某次成功运行。
 2. 在 **Artifacts** 下载对应平台 zip，名称形如：
-   - `miniocr-win-x64` / `miniocr-linux-x64`（**AVX2**）
-   - `miniocr-osx-arm64`（**Apple Silicon only**）/ `miniocr-linux-arm64`（**无 AVX2**）
+   - `miniocr-win-x64` / `miniocr-linux-x64`（**AOT + AVX2**，竞赛推荐）
+   - `miniocr-osx-arm64`（**Apple Silicon only**）/ `miniocr-linux-arm64`（AOT，**无 AVX2**）
+   - `miniocr-win-x64-singlefile` / `miniocr-linux-x64-singlefile`（**真正单文件**，非 AOT，首次运行解压原生库）
    - 不再提供 `osx-x64` / Intel Mac 包
 3. 若通过 **Release** / `v*` 标签触发，zip 也会尽量挂到该 GitHub Release 上，可直接从 Releases 页下载。
 
-解压后目录内含可执行文件与原生依赖（如 `libSkiaSharp` / `pdfium` 的 `.dll` / `.so` / `.dylib`），以及示例 PDF（若打包时存在）。在对应系统上直接运行即可（x64 包要求 CPU 支持 AVX2）。
+**AOT zip：** 解压后含可执行文件 + 原生依赖（`libSkiaSharp` / `pdfium` 的 `.dll` / `.so` / `.dylib`），以及示例 PDF（若打包时存在）；x64 包要求 CPU 支持 AVX2。  
+**单文件 zip：** 解压后通常只有一个 `MiniOcr`（或 `MiniOcr.exe`），拷走即可运行。
 
 ## 架构与内存策略
 
@@ -392,8 +435,8 @@ curl -sS http://127.0.0.1:5080/health
 
 ```
 miniocr/
-  MiniOcr.csproj          # Web + PublishAot + IlcInstructionSet=avx2（仅 x64）
-  .github/workflows/publish.yml  # 多平台 AOT 打包
+  MiniOcr.csproj          # Web + PublishAot + IlcInstructionSet=avx2（仅 x64）；可选 MiniOcrSingleFile
+  .github/workflows/publish.yml  # 多平台 AOT + linux/win 单文件矩阵
   Program.cs              # SlimBuilder + /challenge /ocr /health
   AppJsonContext.cs       # AOT JSON
   Models/OcrModels.cs

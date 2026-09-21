@@ -15,8 +15,20 @@
     <OptimizationPreference>Speed</OptimizationPreference>
     <InvariantGlobalization>false</InvariantGlobalization>
     <StripSymbols>true</StripSymbols>
-    <EnableCompressionInSingleFile>false</EnableCompressionInSingleFile>
-    <DefaultItemExcludes>$(DefaultItemExcludes);tests/**</DefaultItemExcludes>
+    <DefaultItemExcludes>$(DefaultItemExcludes);tests/**;artifacts/**;dist/**;.github/**</DefaultItemExcludes>
+    <StaticWebAssetsEnabled>false</StaticWebAssetsEnabled>
+  </PropertyGroup>
+
+  <!-- Optional true single-file bundle (NOT AOT): embeds libSkiaSharp / libpdfium and
+       extracts them on first run under $HOME/.net/MiniOcr/. Competition default stays AOT. -->
+  <PropertyGroup Condition="'$(MiniOcrSingleFile)' == 'true'">
+    <PublishAot>false</PublishAot>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <PublishTrimmed>true</PublishTrimmed>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
   </PropertyGroup>
 
   <ItemGroup>
@@ -36,7 +48,8 @@
   </ItemGroup>
 
   <ItemGroup>
-    <None Include="samples/sample-multipage.pdf" CopyToOutputDirectory="PreserveNewest" />
+    <!-- Sidecar sample is fine for AOT zip; omit for single-file so the publish dir is one binary -->
+    <None Include="samples/sample-multipage.pdf" CopyToOutputDirectory="PreserveNewest" Condition="'$(MiniOcrSingleFile)' != 'true'" />
   </ItemGroup>
 
 </Project>
