@@ -27,6 +27,7 @@ namespace MiniOcr;
 [JsonSerializable(typeof(VisionChatMessage))]
 [JsonSerializable(typeof(VisionContentPart))]
 [JsonSerializable(typeof(VisionImageUrl))]
+[JsonSerializable(typeof(ThinkingOption))]
 [JsonSerializable(typeof(List<VisionChatMessage>))]
 [JsonSerializable(typeof(List<VisionContentPart>))]
 [JsonSerializable(typeof(LlmEntityPayload))]

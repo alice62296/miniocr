@@ -117,6 +117,7 @@ public sealed partial class LlmEntityExtractor
         {
             Model = _config.Model,
             Temperature = 0,
+            Thinking = _config.ToThinkingOption(),
             Messages =
             [
                 new ChatMessage { Role = "system", Content = SystemPrompt },
@@ -125,9 +126,10 @@ public sealed partial class LlmEntityExtractor
         };
 
         _logger.LogInformation(
-            "LLM NER request: model={Model}, chars={Chars}, url={Url}",
+            "LLM NER request: model={Model}, chars={Chars}, thinking={Thinking}, url={Url}",
             _config.Model,
             userText.Length,
+            body.Thinking?.Type ?? "(null)",
             url);
 
         using HttpResponseMessage response = await _http

@@ -1,3 +1,6 @@
+using System.Text.Json;
+using System.Text.Json.Serialization;
+
 namespace MiniOcr.Models;
 
 /// <summary>Root of MiniOcr config.json (camelCase). Path: see AppConfigStore.</summary>
@@ -24,6 +27,14 @@ public sealed class LlmFileConfig
     public int OcrMaxCharsHint { get; set; } = 8000;
     /// <summary>JPEG encode quality for vision OCR pages (clamped 40–95). Default 70.</summary>
     public int OcrJpegQuality { get; set; } = 70;
+    /// <summary>
+    /// DeepSeek-style thinking mode (bool or "enabled"/"disabled").
+    /// Default false → API sends {"type":"disabled"}. deepseek-flash/v4 enables thinking by default;
+    /// NER/OCR should disable for speed.
+    /// </summary>
+    [JsonConverter(typeof(ThinkingConfigJsonConverter))]
+    public bool Thinking { get; set; } = false;
+
     /// <summary>When LLM is not usable: use EntityExtractor heuristics. Ignored after an LLM NER attempt (never silent heuristic fallback). Default false.</summary>
     public bool FallbackToHeuristics { get; set; } = false;
 }
@@ -55,7 +66,13 @@ public sealed class LlmRuntimeConfig
     public int OcrMaxCharsHint { get; init; } = 8000;
     /// <summary>JPEG quality for vision page images (40–95). Default 70.</summary>
     public int OcrJpegQuality { get; init; } = 70;
+    /// <summary>When true, send thinking.type=enabled; when false (default), send disabled.</summary>
+    public bool Thinking { get; init; } = false;
     public bool FallbackToHeuristics { get; init; } = false;
+
+    /// <summary>Payload for DeepSeek/OpenAI-compatible thinking field.</summary>
+    public ThinkingOption ToThinkingOption() =>
+        new() { Type = Thinking ? "enabled" : "disabled" };
 
     public bool IsUsable =>
         Enabled &&
@@ -70,6 +87,8 @@ public sealed class ChatCompletionRequest
     public string Model { get; set; } = "";
     public List<ChatMessage> Messages { get; set; } = [];
     public double Temperature { get; set; }
+    /// <summary>DeepSeek thinking control: {"type":"enabled"|"disabled"}.</summary>
+    public ThinkingOption? Thinking { get; set; }
 }
 
 public sealed class ChatMessage
@@ -84,6 +103,48 @@ public sealed class VisionChatCompletionRequest
     public string Model { get; set; } = "";
     public List<VisionChatMessage> Messages { get; set; } = [];
     public double Temperature { get; set; }
+    /// <summary>DeepSeek thinking control: {"type":"enabled"|"disabled"}.</summary>
+    public ThinkingOption? Thinking { get; set; }
+}
+
+/// <summary>OpenAI/DeepSeek thinking object serialized as camelCase <c>thinking: { type }</c>.</summary>
+public sealed class ThinkingOption
+{
+    public string Type { get; set; } = "disabled";
+}
+
+/// <summary>
+/// Accepts JSON bool, 0/1 number, or string enabled/disabled/true/false/1/0 for <c>llm.thinking</c>.
+/// </summary>
+public sealed class ThinkingConfigJsonConverter : JsonConverter<bool>
+{
+    public override bool Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        return reader.TokenType switch
+        {
+            JsonTokenType.True => true,
+            JsonTokenType.False => false,
+            JsonTokenType.Null => false,
+            JsonTokenType.Number => reader.TryGetInt64(out long n) ? n != 0 : false,
+            JsonTokenType.String => ParseThinkingString(reader.GetString()),
+            _ => throw new JsonException($"Unexpected token for llm.thinking: {reader.TokenType}"),
+        };
+    }
+
+    public override void Write(Utf8JsonWriter writer, bool value, JsonSerializerOptions options) =>
+        writer.WriteBooleanValue(value);
+
+    public static bool ParseThinkingString(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+            return false;
+        string s = raw.Trim();
+        if (s is "1" or "true" or "True" or "TRUE" or "yes" or "YES" or "on" or "ON" or "enabled" or "Enabled" or "ENABLED")
+            return true;
+        if (s is "0" or "false" or "False" or "FALSE" or "no" or "NO" or "off" or "OFF" or "disabled" or "Disabled" or "DISABLED")
+            return false;
+        return false;
+    }
 }
 
 public sealed class VisionChatMessage

@@ -111,6 +111,7 @@ public sealed partial class LlmVisionOcr
         {
             Model = _config.Model,
             Temperature = 0,
+            Thinking = _config.ToThinkingOption(),
             Messages =
             [
                 new VisionChatMessage
@@ -135,9 +136,10 @@ public sealed partial class LlmVisionOcr
         };
 
         _logger.LogInformation(
-            "LLM vision OCR request: page={Page}, model={Model}, url={Url}",
+            "LLM vision OCR request: page={Page}, model={Model}, thinking={Thinking}, url={Url}",
             pageNumber,
             _config.Model,
+            body.Thinking?.Type ?? "(null)",
             url);
 
         using HttpResponseMessage response = await _http

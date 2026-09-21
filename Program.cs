@@ -63,7 +63,7 @@ Console.WriteLine(
     $"model={llmConfig.Model}, baseUrl={llmConfig.BaseUrl}, " +
     $"maxConcurrency={llmConfig.MaxConcurrency}, maxCharsPerRequest={llmConfig.MaxCharsPerRequest}, " +
     $"ocrConcurrency={llmConfig.OcrConcurrency}, ocrJpegQuality={llmConfig.OcrJpegQuality}, " +
-    $"fallbackToHeuristics={llmConfig.FallbackToHeuristics}, apiKey={apiKeyStatus}");
+    $"thinking={llmConfig.Thinking}, fallbackToHeuristics={llmConfig.FallbackToHeuristics}, apiKey={apiKeyStatus}");
 
 OcrEngine? engine = null;
 if (llmOcrMode)
@@ -446,7 +446,7 @@ app.MapGet("/", () => Results.Text(
     $"ocr.mode={runtimeConfig.Mode} llm.usable={llmConfig.IsUsable} apiKey={apiKeyStatus}\n" +
     "Env CONFIG: MINIOCR_CONFIG_PATH\n" +
     "Env OCR: MINIOCR_OCR_MODE MINIOCR_ENGINES MINIOCR_DPI MINIOCR_LINE_WORKERS MINIOCR_DET_THREADS MINIOCR_USE_CLS MINIOCR_RASTER_WORKERS\n" +
-    "Env LLM: MINIOCR_LLM_API_KEY MINIOCR_LLM_BASE_URL MINIOCR_LLM_MODEL MINIOCR_LLM_MAX_CONCURRENCY MINIOCR_LLM_OCR_CONCURRENCY\n",
+    "Env LLM: MINIOCR_LLM_API_KEY MINIOCR_LLM_BASE_URL MINIOCR_LLM_MODEL MINIOCR_LLM_MAX_CONCURRENCY MINIOCR_LLM_OCR_CONCURRENCY MINIOCR_LLM_THINKING\n",
     "text/plain; charset=utf-8"));
 
 string urls = string.Join(", ", app.Urls.DefaultIfEmpty("(default http://localhost:5000)"));

@@ -236,6 +236,7 @@ cd artifacts/linux-x64-singlefile
     "ocrConcurrency": 32,
     "ocrMaxCharsHint": 8000,
     "ocrJpegQuality": 70,
+    "thinking": false,
     "fallbackToHeuristics": false
   },
   "ocr": {
@@ -254,7 +255,7 @@ cd artifacts/linux-x64-singlefile
 **优先级：**
 
 - OCR：环境变量 `MINIOCR_*` **覆盖** 文件；文件中 `null` / 未写且 `autoScaleFromCpu: true` 时按 CPU 核数自动推算。`MINIOCR_OCR_MODE` 覆盖 `ocr.mode`。
-- LLM：主要读配置文件；可用 `MINIOCR_LLM_API_KEY` / `MINIOCR_LLM_BASE_URL` / `MINIOCR_LLM_MODEL` / `MINIOCR_LLM_MAX_CONCURRENCY` / `MINIOCR_LLM_OCR_CONCURRENCY` / `MINIOCR_LLM_OCR_JPEG_QUALITY` 覆盖。也可用 `MINIOCR_CONFIG_PATH` 指定配置文件。**不会**把 `apiKey` 打进日志（仅显示 `(set)` / `(empty)`）。
+- LLM：主要读配置文件；可用 `MINIOCR_LLM_API_KEY` / `MINIOCR_LLM_BASE_URL` / `MINIOCR_LLM_MODEL` / `MINIOCR_LLM_MAX_CONCURRENCY` / `MINIOCR_LLM_OCR_CONCURRENCY` / `MINIOCR_LLM_OCR_JPEG_QUALITY` / `MINIOCR_LLM_THINKING` 覆盖。也可用 `MINIOCR_CONFIG_PATH` 指定配置文件。**不会**把 `apiKey` 打进日志（仅显示 `(set)` / `(empty)`）。
 
 #### OCR 模式：`local` vs `llm`（视觉 OCR）
 
@@ -300,14 +301,19 @@ cd artifacts/linux-x64-singlefile
 3. 示例：
    - OpenAI：`https://api.openai.com` + `gpt-4o-mini`（视觉 OCR 建议 `gpt-4o` / `gpt-4o-mini`）
    - 通义视觉：按网关文档设置 `baseUrl` + `qwen-vl-*`
-   - DeepSeek：`https://api.deepseek.com` + 对应模型（若无视觉则仅适合 `local` + 文本 NER）
+   - DeepSeek：`https://api.deepseek.com` + 对应模型（若无视觉则仅适合 `local` + 文本 NER）。**Flash/v4 默认开思考**，请保持 `"thinking": false` 以关闭（见上）
    - 本地（如 Ollama 兼容层）：`http://127.0.0.1:11434` + 你的视觉模型名
 4. 或仅用环境变量：`export MINIOCR_LLM_API_KEY=sk-...`（其余仍可读文件）。
 5. **文本 NER 并发**：`llm.maxConcurrency`（默认 **8**，范围 1–32）用于 `local` 模式下的 Chat Completions 批次；`MINIOCR_LLM_MAX_CONCURRENCY` 可覆盖。
 6. **视觉 OCR 并发**：`llm.ocrConcurrency`（默认 **32**，1–256）；`MINIOCR_LLM_OCR_CONCURRENCY` 可覆盖。调高可缩短墙钟时间，但请留意 **费率与限流**。
 7. **视觉 JPEG 质量**：`llm.ocrJpegQuality`（默认 **70**，40–95）；`MINIOCR_LLM_OCR_JPEG_QUALITY` 可覆盖。
 8. **`maxCharsPerRequest`（长上下文）**：默认 **300000**（钳制 1000–2_000_000）。DeepSeek Flash 等约 **1M context** 时可设 `200000`–`800000`，减少批次数、一次塞入更多页；注意提供商 **token** 上限（约 1 个中文字 ≈ 1–2 tokens），勿盲目顶满字符上限。
-9. `local` 模式下 LLM **未启用 / 无 key** 时：仅当 `fallbackToHeuristics: true` 才用启发式 NER（默认 **false** → `entities` 为空）。**一旦调用了 LLM NER**（成功为空或失败），**绝不**再静默回退启发式——记错误日志并返回空实体。`ocr.mode=llm` 视觉路径同样只用结构化视觉输出，不用启发式 invent 实体。
+9. **`thinking`（DeepSeek 思考模式）**：DeepSeek Flash / v4 等模型 **默认开启思考**，会拖慢 NER/OCR。本项目默认 **`thinking: false`（关闭）**，请求体会显式发送：
+   ```json
+   "thinking": { "type": "disabled" }
+   ```
+   需要开启时设 `"thinking": true` 或 `"enabled"`（亦可 `MINIOCR_LLM_THINKING=1|true|enabled`），将发送 `{ "type": "enabled" }`。配置接受布尔或字符串：`false` / `"disabled"` → disabled；`true` / `"enabled"` → enabled。文本 NER 与视觉 OCR 均会带上该字段。
+10. `local` 模式下 LLM **未启用 / 无 key** 时：仅当 `fallbackToHeuristics: true` 才用启发式 NER（默认 **false** → `entities` 为空）。**一旦调用了 LLM NER**（成功为空或失败），**绝不**再静默回退启发式——记错误日志并返回空实体。`ocr.mode=llm` 视觉路径同样只用结构化视觉输出，不用启发式 invent 实体。
 
 ### 吞吐旋钮（文件 + 环境变量 / 请求）
 
@@ -316,6 +322,7 @@ cd artifacts/linux-x64-singlefile
 | `MINIOCR_OCR_MODE` | `ocr.mode` | **local** | `local`（Paddle）或 `llm`（视觉；跳过本地模型） |
 | `MINIOCR_LLM_OCR_CONCURRENCY` | `llm.ocrConcurrency` | **32**（1–256） | `ocr.mode=llm` 时页级视觉并发 |
 | `MINIOCR_LLM_OCR_JPEG_QUALITY` | `llm.ocrJpegQuality` | **70**（40–95） | `ocr.mode=llm` 时页图 JPEG 质量（更低=更快编码/更小上传） |
+| `MINIOCR_LLM_THINKING` | `llm.thinking` | **false**（disabled） | DeepSeek 思考模式；`0/1/false/true/disabled/enabled`；默认关闭并显式发送 `thinking.type=disabled` |
 | `MINIOCR_ENGINES` | `ocr.engines` | **4**（`Clamp(cores/2, 1, min(16,cores))`） | 页级并行 `PaddleOcrAll` 实例数（仅 local） |
 | `MINIOCR_DPI` | `ocr.dpi` | **96**（local）/ **72**（llm，未显式设置时） | 栅格化 DPI（也可在 JSON/`?dpi=` 覆盖） |
 | `MINIOCR_LINE_WORKERS` | `ocr.lineWorkers` | 自动 | 页内 CLS/REC 并行 |
