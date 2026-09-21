@@ -198,15 +198,23 @@ cd artifacts/linux-x64-singlefile
 
 本机冒烟（2026-09-21 CST）：把单独的 `MiniOcr` 拷到空目录启动 → `GET /health` 200 → `POST /ocr` 5 页样例约 1.4 s 返回竞赛形状 JSON；目录旁**无** `.so`。
 
-### 配置文件（%APPDATA% / ApplicationData）
+### 配置文件（AppData / Application Support / XDG）
 
-首次启动会在以下路径创建目录并写入示例 `config.json`（若不存在）：
+**解析优先级：**
 
-| 平台 | 路径公式 |
-| --- | --- |
-| Windows | `%APPDATA%\MiniOcr\config.json`（即 `Environment.GetFolderPath(SpecialFolder.ApplicationData)\MiniOcr\config.json`） |
-| Linux | 通常 `~/.config/MiniOcr/config.json`（同一 API） |
-| macOS | 通常 `~/Library/Application Support/MiniOcr/config.json` |
+1. 环境变量 `MINIOCR_CONFIG_PATH`（指向具体文件）
+2. 若候选路径中**已有文件**，直接读取该文件（不移动、不覆盖）
+3. 否则在**规范创建位置**写入示例 `config.json`
+
+| 平台 | 候选读取路径 | 缺失时规范创建位置 |
+| --- | --- | --- |
+| Windows | `%APPDATA%\MiniOcr\config.json`（`ApplicationData` 为空时回退 `%USERPROFILE%\AppData\Roaming\MiniOcr\config.json`） | 同左（ApplicationData / Roaming） |
+| macOS | **主路径** `~/Library/Application Support/MiniOcr/config.json`；**兼容** `~/.config/MiniOcr/config.json`（旧文档误写 XDG 时用户可能放这里） | `~/Library/Application Support/MiniOcr/config.json` |
+| Linux | `~/.config/MiniOcr/config.json`（以及若与 `ApplicationData` 不同则一并检查） | `~/.config/MiniOcr/config.json` |
+
+> **macOS 注意：** .NET 的 `SpecialFolder.ApplicationData` 对应 `~/Library/Application Support`，**不是** `~/.config`。请把配置放在 Application Support；若你已放在 `~/.config/MiniOcr/config.json`，程序也会读到（不改动原文件）。`ApplicationData` 为空的启动上下文会回退到 `$HOME` 推导路径，避免相对路径 `MiniOcr/config.json` 静默失效。
+
+启动日志与 `GET /health` 会打印**绝对** `configPath`、`configFileExisted`、`configPathSource`（`env` / `existing` / `canonical`）、`llmUsable`、`llmApiKey`（仅 `(set)` / `(empty)`）。
 
 示例内容：
 
@@ -237,7 +245,7 @@ cd artifacts/linux-x64-singlefile
 **优先级：**
 
 - OCR：环境变量 `MINIOCR_*` **覆盖** 文件；文件中 `null` / 未写且 `autoScaleFromCpu: true` 时按 CPU 核数自动推算。
-- LLM：主要读 AppData 文件；可用 `MINIOCR_LLM_API_KEY` / `MINIOCR_LLM_BASE_URL` / `MINIOCR_LLM_MODEL` / `MINIOCR_LLM_MAX_CONCURRENCY` 覆盖。**不会**把 `apiKey` 打进日志（仅显示 `(set)` / `(empty)`）。
+- LLM：主要读配置文件；可用 `MINIOCR_LLM_API_KEY` / `MINIOCR_LLM_BASE_URL` / `MINIOCR_LLM_MODEL` / `MINIOCR_LLM_MAX_CONCURRENCY` 覆盖。也可用 `MINIOCR_CONFIG_PATH` 指定配置文件。**不会**把 `apiKey` 打进日志（仅显示 `(set)` / `(empty)`）。
 
 #### 配置 OpenAI / 兼容接口（DeepSeek、Azure、本地）
 
@@ -276,7 +284,7 @@ cd artifacts/linux-x64-singlefile
 | `lineWorkers` / `detThreads` | 使 `engines × (line + det)` 约在 **1.0–1.5× cores**（目标约 1.25×） |
 | `rasterWorkers` | `Clamp(min(engines, cores/2), 1, 8)` |
 
-启动时日志打印 `ProcessorCount` 与选定的 engines/line/det/raster；`GET /health` 同样暴露这些字段及 `configPath` / LLM 状态（无 key）。
+启动时日志打印 `ProcessorCount` 与选定的 engines/line/det/raster；`GET /health` 同样暴露这些字段及绝对 `configPath` / `configFileExisted` / LLM 状态（`llmApiKey` 仅为 `(set)`/`(empty)`）。
 
 > 更快可降 `MINIOCR_DPI=45`；更高精度可设 `MINIOCR_DPI=150`、`MINIOCR_USE_CLS=1`。显式设置 env/文件中的 engines 等会关闭对该项的自动推算。
 
@@ -441,7 +449,7 @@ miniocr/
   AppJsonContext.cs       # AOT JSON
   Models/OcrModels.cs
   Services/
-    AppConfigStore.cs     # %APPDATA%/MiniOcr/config.json
+    AppConfigStore.cs     # config path resolution (AppData / Application Support / ~/.config)
     OcrRuntimeConfig.cs   # 文件+环境变量+CPU 自动扩缩
     LlmEntityExtractor.cs # OpenAI 兼容 Chat Completions NER
     ParallelPdfDownloader.cs

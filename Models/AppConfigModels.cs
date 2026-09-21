@@ -1,6 +1,6 @@
 namespace MiniOcr.Models;
 
-/// <summary>Root of %APPDATA%/MiniOcr/config.json (camelCase).</summary>
+/// <summary>Root of MiniOcr config.json (camelCase). Path: see AppConfigStore.</summary>
 public sealed class AppConfigFile
 {
     public LlmFileConfig? Llm { get; set; }

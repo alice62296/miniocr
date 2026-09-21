@@ -80,9 +80,13 @@ public sealed class HealthResponse
     public int DetLimitSideLength { get; set; }
     public bool AutoScaleFromCpu { get; set; }
     public string ConfigPath { get; set; } = "";
+    public bool ConfigFileExisted { get; set; }
+    public string ConfigPathSource { get; set; } = "";
     public bool LlmEnabled { get; set; }
     public bool LlmUsable { get; set; }
     public string LlmModel { get; set; } = "";
     public string LlmBaseUrl { get; set; } = "";
     public bool LlmFallbackToHeuristics { get; set; }
+    /// <summary>Never the raw key — only "(set)" or "(empty)".</summary>
+    public string LlmApiKey { get; set; } = "(empty)";
 }

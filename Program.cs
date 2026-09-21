@@ -30,14 +30,18 @@ using ILoggerFactory bootstrapLogs = LoggerFactory.Create(logging =>
 });
 ILogger bootstrapLogger = bootstrapLogs.CreateLogger("MiniOcr.Startup");
 
-string configPath = AppConfigStore.GetConfigPath();
-AppConfigFile appConfig = AppConfigStore.LoadOrCreate(bootstrapLogger);
+AppConfigStore.LoadResult configLoad = AppConfigStore.LoadOrCreate(bootstrapLogger);
+AppConfigFile appConfig = configLoad.Config;
+string configPath = configLoad.ConfigPath;
+bool configFileExisted = configLoad.ConfigFileExisted;
 LlmRuntimeConfig llmConfig = AppConfigStore.ResolveLlm(appConfig);
 OcrRuntimeConfig runtimeConfig = OcrRuntimeConfig.FromAppConfig(appConfig);
+string apiKeyStatus = string.IsNullOrEmpty(llmConfig.ApiKey) ? "(empty)" : "(set)";
 
 Console.WriteLine($"Runtime: {RuntimeInformation.FrameworkDescription}");
 Console.WriteLine($"OS: {RuntimeInformation.OSDescription} ({RuntimeInformation.OSArchitecture})");
-Console.WriteLine($"Config: {configPath}");
+Console.WriteLine(
+    $"Config: path={configPath} existed={configFileExisted} source={configLoad.PathSource}");
 Console.WriteLine(
     $"CPU auto-scale: ProcessorCount={runtimeConfig.ProcessorCount}, autoScaleFromCpu={runtimeConfig.AutoScaleFromCpu}");
 Console.WriteLine(
@@ -48,7 +52,7 @@ Console.WriteLine(
     $"LLM NER: enabled={llmConfig.Enabled}, usable={llmConfig.IsUsable}, " +
     $"model={llmConfig.Model}, baseUrl={llmConfig.BaseUrl}, " +
     $"maxConcurrency={llmConfig.MaxConcurrency}, " +
-    $"fallbackToHeuristics={llmConfig.FallbackToHeuristics}, apiKey={(string.IsNullOrEmpty(llmConfig.ApiKey) ? "(empty)" : "(set)")}");
+    $"fallbackToHeuristics={llmConfig.FallbackToHeuristics}, apiKey={apiKeyStatus}");
 Console.WriteLine("Loading ChineseV6Tiny OCR models...");
 
 OcrEngine engine = await OcrEngine.CreateAsync(
@@ -104,11 +108,14 @@ app.MapGet("/health", (OcrEngine ocr, LlmRuntimeConfig llm, OcrRuntimeConfig cfg
         DetLimitSideLength = ocr.Config.DetLimitSideLength,
         AutoScaleFromCpu = cfg.AutoScaleFromCpu,
         ConfigPath = configPath,
+        ConfigFileExisted = configFileExisted,
+        ConfigPathSource = configLoad.PathSource,
         LlmEnabled = llm.Enabled,
         LlmUsable = llm.IsUsable,
         LlmModel = llm.Model,
         LlmBaseUrl = llm.BaseUrl,
         LlmFallbackToHeuristics = llm.FallbackToHeuristics,
+        LlmApiKey = apiKeyStatus,
     },
     AppJsonContext.Default.HealthResponse));
 
@@ -380,7 +387,8 @@ app.MapGet("/", () => Results.Text(
     "  {\"teamId\":0,\"key\":\"debug\",\"files\":[{\"fileId\":\"f1\",\"url\":\"https://...pdf\"}]}\n" +
     "  or legacy {\"url\":\"https://.../file.pdf\"} / ?dpi=96\n" +
     "GET  /health\n" +
-    $"Config: {configPath}\n" +
+    $"Config: path={configPath} existed={configFileExisted} source={configLoad.PathSource} llm.usable={llmConfig.IsUsable} apiKey={apiKeyStatus}\n" +
+    "Env CONFIG: MINIOCR_CONFIG_PATH\n" +
     "Env OCR: MINIOCR_ENGINES MINIOCR_DPI MINIOCR_LINE_WORKERS MINIOCR_DET_THREADS MINIOCR_USE_CLS MINIOCR_RASTER_WORKERS\n" +
     "Env LLM: MINIOCR_LLM_API_KEY MINIOCR_LLM_BASE_URL MINIOCR_LLM_MODEL MINIOCR_LLM_MAX_CONCURRENCY\n",
     "text/plain; charset=utf-8"));

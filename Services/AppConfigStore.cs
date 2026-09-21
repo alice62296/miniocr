@@ -1,3 +1,5 @@
+using System.Runtime.InteropServices;
+using Microsoft.Extensions.Logging;
 using MiniOcr;
 using System.Text.Json;
 using MiniOcr.Models;
@@ -5,55 +7,134 @@ using MiniOcr.Models;
 namespace MiniOcr.Services;
 
 /// <summary>
-/// Loads / creates MiniOcr config under ApplicationData:
-/// Windows: %APPDATA%\MiniOcr\config.json
-/// Linux/mac: typically ~/.config/MiniOcr/config.json
+/// Loads / creates MiniOcr config.json with platform-aware path resolution.
+///
+/// Priority:
+/// 1. Env MINIOCR_CONFIG_PATH (explicit file path)
+/// 2. First existing file among platform candidates (read in place; do not move)
+/// 3. Canonical create location when none exist
+///
+/// Paths:
+/// - Windows: %APPDATA%\MiniOcr\config.json (fallback: %USERPROFILE%\AppData\Roaming\...)
+/// - macOS: ~/Library/Application Support/MiniOcr/config.json (primary) AND ~/.config/MiniOcr/config.json (fallback read)
+/// - Linux: ~/.config/MiniOcr/config.json (and ApplicationData if different)
+///
+/// Never treats an empty ApplicationData folder path as valid — falls back to HOME/USERPROFILE.
 /// </summary>
 public static class AppConfigStore
 {
     public const string DirName = "MiniOcr";
     public const string FileName = "config.json";
+    public const string ConfigPathEnvVar = "MINIOCR_CONFIG_PATH";
 
+    /// <summary>Result of LoadOrCreate: absolute path + whether the file already existed.</summary>
+    public sealed class LoadResult
+    {
+        public required AppConfigFile Config { get; init; }
+        public required string ConfigPath { get; init; }
+        public required bool ConfigFileExisted { get; init; }
+        public required string PathSource { get; init; }
+    }
+
+    /// <summary>Absolute path that will be used (env / existing candidate / canonical).</summary>
+    public static string GetConfigPath() => ResolveConfigPath().Path;
+
+    /// <summary>Directory of <see cref="GetConfigPath"/>.</summary>
     public static string GetConfigDirectory() =>
-        Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-            DirName);
-
-    public static string GetConfigPath() => Path.Combine(GetConfigDirectory(), FileName);
+        Path.GetDirectoryName(GetConfigPath()) ?? GetCanonicalConfigDirectory();
 
     /// <summary>
-    /// Ensures directory + sample config exist, then deserializes.
+    /// Resolves which config file path to use. Does not create files.
+    /// </summary>
+    public static ResolvedConfigPath ResolveConfigPath(
+        string? envConfigPath = null,
+        string? applicationData = null,
+        string? homeDirectory = null,
+        OSPlatform? os = null)
+    {
+        // null = consult process env; non-null (incl. "") = use that value only
+        string? envPath = envConfigPath is null
+            ? Environment.GetEnvironmentVariable(ConfigPathEnvVar)
+            : envConfigPath;
+        if (!string.IsNullOrWhiteSpace(envPath))
+        {
+            string absolute = MakeAbsolute(envPath.Trim());
+            return new ResolvedConfigPath(absolute, "env", File.Exists(absolute));
+        }
+
+        OSPlatform platform = os ?? CurrentOsPlatform();
+        // null = read from process; "" = explicitly empty (tests / forced fallback)
+        string? appData = applicationData is null
+            ? NullIfEmpty(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData))
+            : NullIfEmpty(applicationData);
+        string? home = homeDirectory is null
+            ? ResolveHomeDirectory()
+            : NullIfEmpty(homeDirectory);
+
+        foreach (string candidate in EnumerateCandidatePaths(platform, appData, home))
+        {
+            if (File.Exists(candidate))
+            {
+                return new ResolvedConfigPath(candidate, "existing", Existed: true);
+            }
+        }
+
+        // Use private overload with already-resolved appData/home (null = empty, do NOT re-read process).
+        string canonical = MakeAbsolute(Path.Combine(GetCanonicalConfigDirectory(platform, appData, home), FileName));
+        return new ResolvedConfigPath(canonical, "canonical", File.Exists(canonical));
+    }
+
+    /// <summary>
+    /// Ensures directory + sample config exist at the resolved path, then deserializes.
     /// Never logs secrets.
     /// </summary>
-    public static AppConfigFile LoadOrCreate(ILogger? logger = null)
+    public static LoadResult LoadOrCreate(ILogger? logger = null)
     {
-        string dir = GetConfigDirectory();
-        string path = GetConfigPath();
+        ResolvedConfigPath resolved = ResolveConfigPath();
+        string path = resolved.Path;
+        bool existed = resolved.Existed;
+        string dir = Path.GetDirectoryName(path) ?? ".";
 
         if (!Directory.Exists(dir))
         {
             Directory.CreateDirectory(dir);
-            logger?.LogInformation("Created config directory: {Dir}", dir);
+            logger?.LogInformation("Created config directory: {Dir}", Path.GetFullPath(dir));
         }
 
         if (!File.Exists(path))
         {
             string sample = BuildSampleJson();
             File.WriteAllText(path, sample);
-            logger?.LogInformation("Wrote sample config: {Path}", path);
+            logger?.LogInformation("Wrote sample config: {Path}", Path.GetFullPath(path));
         }
 
+        string absolutePath = Path.GetFullPath(path);
+        AppConfigFile config;
         try
         {
             string json = File.ReadAllText(path);
             AppConfigFile? file = JsonSerializer.Deserialize(json, AppJsonContext.Default.AppConfigFile);
-            return file ?? new AppConfigFile();
+            config = file ?? new AppConfigFile();
         }
         catch (Exception ex)
         {
-            logger?.LogWarning(ex, "Failed to parse config at {Path}; using defaults", path);
-            return new AppConfigFile();
+            logger?.LogWarning(ex, "Failed to parse config at {Path}; using defaults", absolutePath);
+            config = new AppConfigFile();
         }
+
+        logger?.LogInformation(
+            "Config path={Path} existed={Existed} source={Source}",
+            absolutePath,
+            existed,
+            resolved.Source);
+
+        return new LoadResult
+        {
+            Config = config,
+            ConfigPath = absolutePath,
+            ConfigFileExisted = existed,
+            PathSource = resolved.Source,
+        };
     }
 
     public static LlmRuntimeConfig ResolveLlm(AppConfigFile file)
@@ -93,6 +174,162 @@ public static class AppConfigStore
             FallbackToHeuristics = llm.FallbackToHeuristics,
         };
     }
+
+    /// <summary>Candidate paths in preference order (may include duplicates; caller should de-dupe).</summary>
+    public static IEnumerable<string> EnumerateCandidatePaths(
+        OSPlatform platform,
+        string? applicationData,
+        string? homeDirectory)
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (string raw in EnumerateCandidatePathsCore(platform, applicationData, homeDirectory))
+        {
+            string absolute = MakeAbsolute(raw);
+            if (seen.Add(absolute))
+                yield return absolute;
+        }
+    }
+
+    public static string GetCanonicalConfigPath(
+        OSPlatform? os = null,
+        string? applicationData = null,
+        string? homeDirectory = null)
+    {
+        OSPlatform platform = os ?? CurrentOsPlatform();
+        string? appData = applicationData is null
+            ? NullIfEmpty(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData))
+            : NullIfEmpty(applicationData);
+        string? home = homeDirectory is null
+            ? ResolveHomeDirectory()
+            : NullIfEmpty(homeDirectory);
+        return MakeAbsolute(Path.Combine(GetCanonicalConfigDirectory(platform, appData, home), FileName));
+    }
+
+    public static string GetCanonicalConfigDirectory(
+        OSPlatform? os = null,
+        string? applicationData = null,
+        string? homeDirectory = null)
+    {
+        OSPlatform platform = os ?? CurrentOsPlatform();
+        string? appData = applicationData is null
+            ? NullIfEmpty(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData))
+            : NullIfEmpty(applicationData);
+        string? home = homeDirectory is null
+            ? ResolveHomeDirectory()
+            : NullIfEmpty(homeDirectory);
+        return GetCanonicalConfigDirectory(platform, appData, home);
+    }
+
+    public readonly record struct ResolvedConfigPath(string Path, string Source, bool Existed);
+
+    private static IEnumerable<string> EnumerateCandidatePathsCore(
+        OSPlatform platform,
+        string? applicationData,
+        string? homeDirectory)
+    {
+        if (platform == OSPlatform.OSX)
+        {
+            // Primary: Application Support (real macOS ApplicationData)
+            if (!string.IsNullOrWhiteSpace(applicationData))
+                yield return Path.Combine(applicationData, DirName, FileName);
+            else if (!string.IsNullOrWhiteSpace(homeDirectory))
+                yield return Path.Combine(homeDirectory, "Library", "Application Support", DirName, FileName);
+
+            // Fallback: XDG-style ~/.config (users may have put the file here due to old docs)
+            if (!string.IsNullOrWhiteSpace(homeDirectory))
+                yield return Path.Combine(homeDirectory, ".config", DirName, FileName);
+            yield break;
+        }
+
+        if (platform == OSPlatform.Windows)
+        {
+            if (!string.IsNullOrWhiteSpace(applicationData))
+                yield return Path.Combine(applicationData, DirName, FileName);
+            else if (!string.IsNullOrWhiteSpace(homeDirectory))
+                yield return Path.Combine(homeDirectory, "AppData", "Roaming", DirName, FileName);
+            yield break;
+        }
+
+        // Linux and other Unix: prefer ~/.config, then ApplicationData if different
+        if (!string.IsNullOrWhiteSpace(homeDirectory))
+            yield return Path.Combine(homeDirectory, ".config", DirName, FileName);
+
+        if (!string.IsNullOrWhiteSpace(applicationData))
+            yield return Path.Combine(applicationData, DirName, FileName);
+    }
+
+    private static string GetCanonicalConfigDirectory(
+        OSPlatform platform,
+        string? applicationData,
+        string? homeDirectory)
+    {
+        if (platform == OSPlatform.Linux)
+        {
+            if (!string.IsNullOrWhiteSpace(homeDirectory))
+                return Path.Combine(homeDirectory, ".config", DirName);
+            if (!string.IsNullOrWhiteSpace(applicationData))
+                return Path.Combine(applicationData, DirName);
+            return Path.Combine(".", DirName);
+        }
+
+        // Windows + macOS: ApplicationData/MiniOcr, with HOME/USERPROFILE fallback
+        if (!string.IsNullOrWhiteSpace(applicationData))
+            return Path.Combine(applicationData, DirName);
+
+        if (platform == OSPlatform.OSX && !string.IsNullOrWhiteSpace(homeDirectory))
+            return Path.Combine(homeDirectory, "Library", "Application Support", DirName);
+
+        if (platform == OSPlatform.Windows && !string.IsNullOrWhiteSpace(homeDirectory))
+            return Path.Combine(homeDirectory, "AppData", "Roaming", DirName);
+
+        if (!string.IsNullOrWhiteSpace(homeDirectory))
+            return Path.Combine(homeDirectory, ".config", DirName);
+
+        return Path.Combine(".", DirName);
+    }
+
+    public static string? ResolveHomeDirectory()
+    {
+        string? home = NullIfEmpty(Environment.GetEnvironmentVariable("HOME"));
+        if (home is not null)
+            return home;
+        return NullIfEmpty(Environment.GetEnvironmentVariable("USERPROFILE"));
+    }
+
+    private static OSPlatform CurrentOsPlatform()
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            return OSPlatform.Windows;
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+            return OSPlatform.OSX;
+        return OSPlatform.Linux;
+    }
+
+    private static string MakeAbsolute(string path)
+    {
+        // Keep Windows drive-letter paths intact when not running on Windows
+        // (smoke tests may resolve OSPlatform.Windows on Linux).
+        if (path.Length >= 3 &&
+            char.IsLetter(path[0]) &&
+            path[1] == ':' &&
+            (path[2] == '\\' || path[2] == '/') &&
+            !RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return path.Replace('/', '\\');
+        }
+
+        try
+        {
+            return Path.GetFullPath(path);
+        }
+        catch
+        {
+            return path;
+        }
+    }
+
+    private static string? NullIfEmpty(string? value) =>
+        string.IsNullOrWhiteSpace(value) ? null : value.Trim();
 
     private static string? FirstNonEmpty(string? a, string? b)
     {
