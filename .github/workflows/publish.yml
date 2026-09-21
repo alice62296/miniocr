@@ -1,0 +1,118 @@
+# Native AOT packaging for MiniOCR across major platforms.
+# Project "async2" request means AVX2 (IlcInstructionSet=avx2) for x64 SimdPaddleOCR, NOT async.
+name: Publish Native AOT
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    name: ${{ matrix.rid }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # x64 + AVX2 (SimdPaddleOCR)
+          - rid: win-x64
+            os: windows-latest
+            avx2: true
+          - rid: linux-x64
+            os: ubuntu-latest
+            avx2: true
+          # macos-13 = Intel x64 runners (AVX2). If GitHub retires macos-13,
+          # remove this entry — do not cross-compile Native AOT from ARM.
+          - rid: osx-x64
+            os: macos-13
+            avx2: true
+          # ARM64: no AVX2 (NEON baseline)
+          - rid: osx-arm64
+            os: macos-latest
+            avx2: false
+          # Native linux-arm64 runner (no qemu). If the runner label is
+          # unavailable for the repo, remove this matrix entry.
+          - rid: linux-arm64
+            os: ubuntu-24.04-arm
+            avx2: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 11 RC
+        uses: actions/setup-dotnet@v4
+        with:
+          # Project TFM is net11.0; install latest 11.0.x preview/RC
+          dotnet-version: "11.0.x"
+          dotnet-quality: preview
+
+      - name: Publish Native AOT (${{ matrix.rid }})
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="artifacts/${{ matrix.rid }}"
+          mkdir -p "$OUT"
+          EXTRA_PROPS=()
+          if [ "${{ matrix.avx2 }}" = "true" ]; then
+            # Belt-and-suspenders with csproj x64-only Condition
+            EXTRA_PROPS+=(/p:IlcInstructionSet=avx2)
+          fi
+          dotnet publish MiniOcr.csproj \
+            -c Release \
+            -r "${{ matrix.rid }}" \
+            --self-contained true \
+            -o "$OUT" \
+            "${EXTRA_PROPS[@]}"
+
+      - name: Package zip (exclude .dbg)
+        shell: bash
+        run: |
+          set -euo pipefail
+          RID="${{ matrix.rid }}"
+          SRC="artifacts/${RID}"
+          # Drop large debug symbol files if present (StripSymbols=true already)
+          find "$SRC" -type f \( -name '*.dbg' -o -name '*.pdb' \) -delete || true
+          mkdir -p dist
+          if command -v zip >/dev/null 2>&1; then
+            (cd artifacts && zip -r "../dist/miniocr-${RID}.zip" "${RID}")
+          else
+            # windows-latest often lacks zip(1)
+            if command -v pwsh >/dev/null 2>&1; then
+              pwsh -NoLogo -NoProfile -Command \
+                "Compress-Archive -Path 'artifacts/${RID}/*' -DestinationPath 'dist/miniocr-${RID}.zip' -Force"
+            else
+              powershell -NoLogo -NoProfile -Command \
+                "Compress-Archive -Path 'artifacts\\${RID}\\*' -DestinationPath 'dist\\miniocr-${RID}.zip' -Force"
+            fi
+          fi
+          ls -la "dist/miniocr-${RID}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: miniocr-${{ matrix.rid }}
+          path: dist/miniocr-${{ matrix.rid }}.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach zip to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/miniocr-${{ matrix.rid }}.zip
+          tag_name: ${{ github.event.release.tag_name || github.ref_name }}
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

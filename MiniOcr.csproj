@@ -8,9 +8,10 @@
     <RootNamespace>MiniOcr</RootNamespace>
     <NoWarn>$(NoWarn);CA1416;IL2026;IL3050</NoWarn>
 
-    <!-- Native AOT (x64): IlcInstructionSet=avx2 is required for SimdPaddleOCR speed -->
+    <!-- Native AOT: IlcInstructionSet=avx2 is required for SimdPaddleOCR speed on x64 only.
+         ARM64 must NOT set avx2 (uses NEON baseline). -->
     <PublishAot>true</PublishAot>
-    <IlcInstructionSet>avx2</IlcInstructionSet>
+    <IlcInstructionSet Condition="$([System.String]::Copy('$(RuntimeIdentifier)').Contains('x64'))">avx2</IlcInstructionSet>
     <OptimizationPreference>Speed</OptimizationPreference>
     <InvariantGlobalization>false</InvariantGlobalization>
     <StripSymbols>true</StripSymbols>

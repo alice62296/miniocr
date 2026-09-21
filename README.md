@@ -6,10 +6,10 @@
 
 ## 环境要求
 
-- Linux x64（推荐；本仓库在 Debian 13 x64 上构建）
+- 目标平台：Windows / Linux / macOS（x64 与 ARM64）；本仓库 CI 产出多平台 Native AOT 包
 - [.NET 11 RC SDK](https://dotnet.microsoft.com/download/dotnet/11.0)
 - Native AOT 需要本机 C 工具链（`gcc` / `clang` + zlib 等）
-- CPU 需支持 **AVX2**（见下方 AOT 说明）
+- **x64** 正式包启用 **AVX2**（见下方 AOT / CI 说明）；**ARM64** 不使用 AVX2
 
 ### 安装 .NET 11 RC（Linux）
 
@@ -175,20 +175,33 @@ curl -sS http://127.0.0.1:5080/health
 
 **局限：** 启发式会漏/误；LLM 依赖模型与 OCR 文本质量，竞赛场景请复核关键实体。
 
-## Native AOT 注意（avx2）
+## Native AOT 注意（avx2，仅 x64）
 
 项目已设置：
 
 ```xml
 <PublishAot>true</PublishAot>
-<IlcInstructionSet>avx2</IlcInstructionSet>
+<!-- 仅当 RuntimeIdentifier 含 x64 时启用；ARM64 不会设置 avx2 -->
+<IlcInstructionSet Condition="$([System.String]::Copy('$(RuntimeIdentifier)').Contains('x64'))">avx2</IlcInstructionSet>
 ```
 
-**必须**保留 `IlcInstructionSet=avx2`。否则 ILC 按 SSE2 / 128-bit `Vector<T>` 基线编译，`Avx2.IsSupported` 会被折成 `false`，SimdPaddleOCR 的 AVX2 内核整段裁掉，OCR 会慢很多。
+对 **x64**：**必须**保留 `IlcInstructionSet=avx2`。否则 ILC 按 SSE2 / 128-bit `Vector<T>` 基线编译，`Avx2.IsSupported` 会被折成 `false`，SimdPaddleOCR 的 AVX2 内核整段裁掉，OCR 会慢很多。
 
-- 无 AVX2 的 CPU：不要设置该项（或改用非 AOT / 更低指令集），否则进程可能无法启动。
-- ARM64：一般不需要写 `IlcInstructionSet`（基线含 NEON）。
+- **无 AVX2 的 x64 CPU**：不要下载/运行带 AVX2 的 x64 包（可能无法启动）。请自行去掉 `IlcInstructionSet` 后本地发布，或改用非 AOT。
+- **ARM64**（`linux-arm64` / `osx-arm64`）：不设置 `IlcInstructionSet`（基线含 NEON），与 x64 AVX2 包无关。
 - AOT 禁用反射密集 API；本项目使用 `JsonSerializerContext` + `WebApplication.CreateSlimBuilder`。
+
+## 下载 CI 产物（GitHub Actions）
+
+推送到 `main`、手动 `workflow_dispatch`，或发布 Release / 打 `v*` 标签时，工作流 [`.github/workflows/publish.yml`](.github/workflows/publish.yml) 会为各 RID 构建 Native AOT 并上传制品。
+
+1. 打开仓库 **Actions** → 选中 **Publish Native AOT** 某次成功运行。
+2. 在 **Artifacts** 下载对应平台 zip，名称形如：
+   - `miniocr-win-x64` / `miniocr-linux-x64` / `miniocr-osx-x64`（**AVX2**）
+   - `miniocr-osx-arm64` / `miniocr-linux-arm64`（**无 AVX2**）
+3. 若通过 **Release** / `v*` 标签触发，zip 也会尽量挂到该 GitHub Release 上，可直接从 Releases 页下载。
+
+解压后目录内含可执行文件与原生依赖（如 `libSkiaSharp` / `pdfium` 的 `.dll` / `.so` / `.dylib`），以及示例 PDF（若打包时存在）。在对应系统上直接运行即可（x64 包要求 CPU 支持 AVX2）。
 
 ## 架构与内存策略
 
@@ -226,7 +239,8 @@ curl -sS http://127.0.0.1:5080/health
 
 ```
 miniocr/
-  MiniOcr.csproj          # Web + PublishAot + IlcInstructionSet=avx2
+  MiniOcr.csproj          # Web + PublishAot + IlcInstructionSet=avx2（仅 x64）
+  .github/workflows/publish.yml  # 多平台 AOT 打包
   Program.cs              # SlimBuilder + /ocr /health
   AppJsonContext.cs       # AOT JSON
   Models/OcrModels.cs
