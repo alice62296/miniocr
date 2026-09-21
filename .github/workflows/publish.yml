@@ -64,17 +64,24 @@ jobs:
           set -euo pipefail
           OUT="artifacts/${{ matrix.rid }}"
           mkdir -p "$OUT"
-          EXTRA_PROPS=()
+          # Use -p: (not /p:) — Git Bash on Windows strips the leading slash and
+          # MSBuild then treats "p:IlcInstructionSet=avx2" as a second project
+          # (MSB1008 Only one project can be specified).
+          # Avoid empty "${arr[@]}" under set -u (unbound on macOS bash 3.x).
           if [ "${{ matrix.avx2 }}" = "true" ]; then
-            # Belt-and-suspenders with csproj x64-only Condition
-            EXTRA_PROPS+=(/p:IlcInstructionSet=avx2)
+            dotnet publish ./MiniOcr.csproj \
+              -c Release \
+              -r "${{ matrix.rid }}" \
+              --self-contained true \
+              -o "$OUT" \
+              -p:IlcInstructionSet=avx2
+          else
+            dotnet publish ./MiniOcr.csproj \
+              -c Release \
+              -r "${{ matrix.rid }}" \
+              --self-contained true \
+              -o "$OUT"
           fi
-          dotnet publish MiniOcr.csproj \
-            -c Release \
-            -r "${{ matrix.rid }}" \
-            --self-contained true \
-            -o "$OUT" \
-            "${EXTRA_PROPS[@]}"
 
       - name: Package zip (exclude .dbg)
         shell: bash
