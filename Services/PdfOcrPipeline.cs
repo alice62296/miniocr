@@ -431,7 +431,9 @@ public sealed class PdfOcrPipeline
     private async Task<OcrEntities> ExtractEntitiesAsync(OcrPageResult[] pages, CancellationToken ct)
     {
         bool preferLlm = _llm is { IsUsable: true };
-        bool fallback = _llm?.Config.FallbackToHeuristics ?? true;
+        // Heuristics only when LLM was never attempted (disabled / no key).
+        // After an LLM NER attempt, never fall back — log and return empty.
+        bool fallbackWhenNoLlm = _llm?.Config.FallbackToHeuristics ?? false;
 
         if (preferLlm)
         {
@@ -446,14 +448,22 @@ public sealed class PdfOcrPipeline
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "LLM NER failed; fallbackToHeuristics={Fallback}", fallback);
-                if (!fallback)
-                    return new OcrEntities();
+                _logger.LogError(
+                    ex,
+                    "LLM NER failed; returning empty entities (no heuristic fallback after LLM)");
+                return new OcrEntities();
             }
         }
 
-        List<string> texts = pages.Select(p => p.Text ?? "").ToList();
-        return EntityExtractor.ExtractFromPages(texts);
+        if (fallbackWhenNoLlm)
+        {
+            List<string> texts = pages.Select(p => p.Text ?? "").ToList();
+            return EntityExtractor.ExtractFromPages(texts);
+        }
+
+        _logger.LogInformation(
+            "LLM NER unused/unconfigured and fallbackToHeuristics=false — empty entities");
+        return new OcrEntities();
     }
 
     private async Task ProduceParallelAsync(

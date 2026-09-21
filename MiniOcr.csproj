@@ -33,7 +33,7 @@
 
   <ItemGroup>
     <PackageReference Include="PDFtoImage" Version="5.4.0" />
-    <PackageReference Include="Sdcb.SimdPaddleOCR" Version="1.4.1" />
+    <PackageReference Include="Sdcb.SimdPaddleOCR" Version="1.4.2" />
     <PackageReference Include="Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny" Version="1.0.0" />
   </ItemGroup>
 

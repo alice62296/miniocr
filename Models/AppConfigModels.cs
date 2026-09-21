@@ -14,16 +14,18 @@ public sealed class LlmFileConfig
     public string ApiKey { get; set; } = "";
     public string Model { get; set; } = "gpt-4o-mini";
     public int TimeoutSeconds { get; set; } = 120;
-    public int MaxCharsPerRequest { get; set; } = 12000;
-    /// <summary>Max parallel LLM NER batch completions (clamped 1–32).</summary>
-    public int MaxConcurrency { get; set; } = 4;
+    /// <summary>Max OCR text chars per LLM NER batch (clamped 1000–2_000_000). Default 300000 for long-context models.</summary>
+    public int MaxCharsPerRequest { get; set; } = 300000;
+    /// <summary>Max parallel LLM NER batch completions (clamped 1–32). Default 8.</summary>
+    public int MaxConcurrency { get; set; } = 8;
     /// <summary>Max parallel vision OCR page calls when ocr.mode=llm (clamped 1–256).</summary>
     public int OcrConcurrency { get; set; } = 32;
     /// <summary>Hint for max chars of page text the vision model should return.</summary>
     public int OcrMaxCharsHint { get; set; } = 8000;
     /// <summary>JPEG encode quality for vision OCR pages (clamped 40–95). Default 70.</summary>
     public int OcrJpegQuality { get; set; } = 70;
-    public bool FallbackToHeuristics { get; set; } = true;
+    /// <summary>When LLM is not usable: use EntityExtractor heuristics. Ignored after an LLM NER attempt (never silent heuristic fallback). Default false.</summary>
+    public bool FallbackToHeuristics { get; set; } = false;
 }
 
 public sealed class OcrFileConfig
@@ -47,13 +49,13 @@ public sealed class LlmRuntimeConfig
     public string ApiKey { get; init; } = "";
     public string Model { get; init; } = "gpt-4o-mini";
     public int TimeoutSeconds { get; init; } = 120;
-    public int MaxCharsPerRequest { get; init; } = 12000;
-    public int MaxConcurrency { get; init; } = 4;
+    public int MaxCharsPerRequest { get; init; } = 300000;
+    public int MaxConcurrency { get; init; } = 8;
     public int OcrConcurrency { get; init; } = 32;
     public int OcrMaxCharsHint { get; init; } = 8000;
     /// <summary>JPEG quality for vision page images (40–95). Default 70.</summary>
     public int OcrJpegQuality { get; init; } = 70;
-    public bool FallbackToHeuristics { get; init; } = true;
+    public bool FallbackToHeuristics { get; init; } = false;
 
     public bool IsUsable =>
         Enabled &&

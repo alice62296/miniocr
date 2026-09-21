@@ -153,7 +153,7 @@ public static class AppConfigStore
             Environment.GetEnvironmentVariable("MINIOCR_LLM_MODEL"),
             llm.Model) ?? "gpt-4o-mini";
 
-        int maxConcurrency = llm.MaxConcurrency <= 0 ? 4 : llm.MaxConcurrency;
+        int maxConcurrency = llm.MaxConcurrency <= 0 ? 8 : llm.MaxConcurrency;
         string? envConcurrency = Environment.GetEnvironmentVariable("MINIOCR_LLM_MAX_CONCURRENCY");
         if (!string.IsNullOrWhiteSpace(envConcurrency) &&
             int.TryParse(envConcurrency.Trim(), out int parsedConcurrency))
@@ -187,7 +187,7 @@ public static class AppConfigStore
             Model = model,
             TimeoutSeconds = Math.Clamp(llm.TimeoutSeconds <= 0 ? 120 : llm.TimeoutSeconds, 5, 600),
             MaxCharsPerRequest = Math.Clamp(
-                llm.MaxCharsPerRequest <= 0 ? 12000 : llm.MaxCharsPerRequest, 1000, 200_000),
+                llm.MaxCharsPerRequest <= 0 ? 300_000 : llm.MaxCharsPerRequest, 1000, 2_000_000),
             MaxConcurrency = Math.Clamp(maxConcurrency, 1, 32),
             OcrConcurrency = Math.Clamp(ocrConcurrency, 1, 256),
             OcrMaxCharsHint = Math.Clamp(ocrMaxChars, 500, 100_000),
@@ -370,12 +370,12 @@ public static class AppConfigStore
             "apiKey": "",
             "model": "gpt-4o-mini",
             "timeoutSeconds": 120,
-            "maxCharsPerRequest": 12000,
-            "maxConcurrency": 4,
+            "maxCharsPerRequest": 300000,
+            "maxConcurrency": 8,
             "ocrConcurrency": 32,
             "ocrMaxCharsHint": 8000,
             "ocrJpegQuality": 70,
-            "fallbackToHeuristics": true
+            "fallbackToHeuristics": false
           },
           "ocr": {
             "mode": "local",
