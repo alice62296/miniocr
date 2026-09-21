@@ -65,6 +65,7 @@ dotnet run -c Release --urls http://127.0.0.1:5080
     "model": "gpt-4o-mini",
     "timeoutSeconds": 120,
     "maxCharsPerRequest": 12000,
+    "maxConcurrency": 4,
     "fallbackToHeuristics": true
   },
   "ocr": {
@@ -82,7 +83,7 @@ dotnet run -c Release --urls http://127.0.0.1:5080
 **优先级：**
 
 - OCR：环境变量 `MINIOCR_*` **覆盖** 文件；文件中 `null` / 未写且 `autoScaleFromCpu: true` 时按 CPU 核数自动推算。
-- LLM：主要读 AppData 文件；可用 `MINIOCR_LLM_API_KEY` / `MINIOCR_LLM_BASE_URL` / `MINIOCR_LLM_MODEL` 覆盖。**不会**把 `apiKey` 打进日志（仅显示 `(set)` / `(empty)`）。
+- LLM：主要读 AppData 文件；可用 `MINIOCR_LLM_API_KEY` / `MINIOCR_LLM_BASE_URL` / `MINIOCR_LLM_MODEL` / `MINIOCR_LLM_MAX_CONCURRENCY` 覆盖。**不会**把 `apiKey` 打进日志（仅显示 `(set)` / `(empty)`）。
 
 #### 配置 OpenAI / 兼容接口（DeepSeek、Azure、本地）
 
@@ -93,7 +94,8 @@ dotnet run -c Release --urls http://127.0.0.1:5080
    - DeepSeek：`https://api.deepseek.com` + `deepseek-chat`
    - 本地（如 Ollama 兼容层）：`http://127.0.0.1:11434` + 你的模型名
 4. 或仅用环境变量：`export MINIOCR_LLM_API_KEY=sk-...`（其余仍可读文件）。
-5. `enabled: false` 或没有 key 时：若 `fallbackToHeuristics: true`（默认）则用启发式 NER；否则 `entities` 为空。
+5. **并发批次**：`llm.maxConcurrency`（默认 **4**，范围 1–32）控制同时进行的 Chat Completions 批次数；环境变量 `MINIOCR_LLM_MAX_CONCURRENCY` 可覆盖。启动日志会打印 `maxConcurrency=…`；首次 NER 时也会记录 `batches` 与并发度。调高可缩短长文档 NER 墙钟时间，但请留意提供商 **RPM / TPM** 限流（过高易 429）；本地模型则受 GPU/CPU 吞吐约束。
+6. `enabled: false` 或没有 key 时：若 `fallbackToHeuristics: true`（默认）则用启发式 NER；否则 `entities` 为空。
 
 ### 吞吐旋钮（文件 + 环境变量 / 请求）
 
@@ -163,7 +165,7 @@ curl -sS http://127.0.0.1:5080/health
 
 全部页 OCR 完成后抽取 `entities`：
 
-1. **LLM（推荐）**：若 `llm.enabled` 且配置了 `apiKey`，将页文本按 `maxCharsPerRequest`（默认 12000 字）分批，调用 OpenAI 兼容 `POST {baseUrl}/v1/chat/completions`，提示词要求只返回严格 JSON `{"companies":["..."],"persons":["..."]}`（中英均可；禁止臆造正文没有的名字）。各批结果合并去重，再回扫各页文本填充 `pages` / `count`。
+1. **LLM（推荐）**：若 `llm.enabled` 且配置了 `apiKey`，将页文本按 `maxCharsPerRequest`（默认 12000 字）分批，并以 `maxConcurrency`（默认 4）为上限**并行**调用 OpenAI 兼容 `POST {baseUrl}/v1/chat/completions`，提示词要求只返回严格 JSON `{"companies":["..."],"persons":["..."]}`（中英均可；禁止臆造正文没有的名字）。各批结果线程安全合并去重，再回扫各页文本填充 `pages` / `count`。
 2. **启发式回退**：LLM 未启用、无 key、或请求失败且 `fallbackToHeuristics: true` 时，使用 `EntityExtractor`（Regex + 百家姓 HashSet，`[GeneratedRegex]`，无 ML 包，AOT 安全）。
 
 | 类型 | 启发式规则（摘要，作回退） |

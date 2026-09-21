@@ -41,6 +41,7 @@ Console.WriteLine(
 Console.WriteLine(
     $"LLM NER: enabled={llmConfig.Enabled}, usable={llmConfig.IsUsable}, " +
     $"model={llmConfig.Model}, baseUrl={llmConfig.BaseUrl}, " +
+    $"maxConcurrency={llmConfig.MaxConcurrency}, " +
     $"fallbackToHeuristics={llmConfig.FallbackToHeuristics}, apiKey={(string.IsNullOrEmpty(llmConfig.ApiKey) ? "(empty)" : "(set)")}");
 Console.WriteLine("Loading ChineseV6Tiny OCR models...");
 
@@ -185,7 +186,7 @@ app.MapGet("/", () => Results.Text(
     "GET  /health\n" +
     $"Config: {configPath}\n" +
     "Env OCR: MINIOCR_ENGINES MINIOCR_DPI MINIOCR_LINE_WORKERS MINIOCR_DET_THREADS MINIOCR_USE_CLS MINIOCR_RASTER_WORKERS\n" +
-    "Env LLM: MINIOCR_LLM_API_KEY MINIOCR_LLM_BASE_URL MINIOCR_LLM_MODEL\n",
+    "Env LLM: MINIOCR_LLM_API_KEY MINIOCR_LLM_BASE_URL MINIOCR_LLM_MODEL MINIOCR_LLM_MAX_CONCURRENCY\n",
     "text/plain; charset=utf-8"));
 
 string urls = string.Join(", ", app.Urls.DefaultIfEmpty("(default http://localhost:5000)"));

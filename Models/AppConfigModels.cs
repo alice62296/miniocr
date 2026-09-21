@@ -15,6 +15,8 @@ public sealed class LlmFileConfig
     public string Model { get; set; } = "gpt-4o-mini";
     public int TimeoutSeconds { get; set; } = 120;
     public int MaxCharsPerRequest { get; set; } = 12000;
+    /// <summary>Max parallel LLM batch completions (clamped 1–32).</summary>
+    public int MaxConcurrency { get; set; } = 4;
     public bool FallbackToHeuristics { get; set; } = true;
 }
 
@@ -38,6 +40,7 @@ public sealed class LlmRuntimeConfig
     public string Model { get; init; } = "gpt-4o-mini";
     public int TimeoutSeconds { get; init; } = 120;
     public int MaxCharsPerRequest { get; init; } = 12000;
+    public int MaxConcurrency { get; init; } = 4;
     public bool FallbackToHeuristics { get; init; } = true;
 
     public bool IsUsable =>

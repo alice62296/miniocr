@@ -49,32 +49,63 @@ public sealed partial class LlmEntityExtractor
         if (!IsUsable)
             throw new InvalidOperationException("LLM entity extraction is not configured.");
 
+        List<PageBatch> batches = BuildBatches(pages, _config.MaxCharsPerRequest);
         List<string> companies = [];
         List<string> persons = [];
+        object mergeLock = new();
 
-        foreach (PageBatch batch in BuildBatches(pages, _config.MaxCharsPerRequest))
-        {
-            LlmEntityPayload payload = await CompleteBatchAsync(batch.Text, ct).ConfigureAwait(false);
-            if (payload.Companies is not null)
-            {
-                foreach (string c in payload.Companies)
-                {
-                    string n = NormalizeName(c);
-                    if (n.Length > 0)
-                        companies.Add(n);
-                }
-            }
+        int concurrency = Math.Clamp(_config.MaxConcurrency, 1, 32);
+        _logger.LogInformation(
+            "LLM NER batches: count={BatchCount}, maxConcurrency={MaxConcurrency}",
+            batches.Count,
+            concurrency);
 
-            if (payload.Persons is not null)
+        if (batches.Count == 0)
+            return MergeToEntities(pages, companies, persons);
+
+        await Parallel.ForEachAsync(
+            batches,
+            new ParallelOptions
             {
-                foreach (string p in payload.Persons)
+                MaxDegreeOfParallelism = concurrency,
+                CancellationToken = ct,
+            },
+            async (batch, token) =>
+            {
+                LlmEntityPayload payload = await CompleteBatchAsync(batch.Text, token)
+                    .ConfigureAwait(false);
+
+                List<string> localCompanies = [];
+                List<string> localPersons = [];
+                if (payload.Companies is not null)
                 {
-                    string n = NormalizeName(p);
-                    if (n.Length > 0)
-                        persons.Add(n);
+                    foreach (string c in payload.Companies)
+                    {
+                        string n = NormalizeName(c);
+                        if (n.Length > 0)
+                            localCompanies.Add(n);
+                    }
                 }
-            }
-        }
+
+                if (payload.Persons is not null)
+                {
+                    foreach (string person in payload.Persons)
+                    {
+                        string n = NormalizeName(person);
+                        if (n.Length > 0)
+                            localPersons.Add(n);
+                    }
+                }
+
+                if (localCompanies.Count == 0 && localPersons.Count == 0)
+                    return;
+
+                lock (mergeLock)
+                {
+                    companies.AddRange(localCompanies);
+                    persons.AddRange(localPersons);
+                }
+            }).ConfigureAwait(false);
 
         return MergeToEntities(pages, companies, persons);
     }

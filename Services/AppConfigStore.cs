@@ -72,6 +72,14 @@ public static class AppConfigStore
             Environment.GetEnvironmentVariable("MINIOCR_LLM_MODEL"),
             llm.Model) ?? "gpt-4o-mini";
 
+        int maxConcurrency = llm.MaxConcurrency <= 0 ? 4 : llm.MaxConcurrency;
+        string? envConcurrency = Environment.GetEnvironmentVariable("MINIOCR_LLM_MAX_CONCURRENCY");
+        if (!string.IsNullOrWhiteSpace(envConcurrency) &&
+            int.TryParse(envConcurrency.Trim(), out int parsedConcurrency))
+        {
+            maxConcurrency = parsedConcurrency;
+        }
+
         return new LlmRuntimeConfig
         {
             Enabled = llm.Enabled,
@@ -81,6 +89,7 @@ public static class AppConfigStore
             TimeoutSeconds = Math.Clamp(llm.TimeoutSeconds <= 0 ? 120 : llm.TimeoutSeconds, 5, 600),
             MaxCharsPerRequest = Math.Clamp(
                 llm.MaxCharsPerRequest <= 0 ? 12000 : llm.MaxCharsPerRequest, 1000, 200_000),
+            MaxConcurrency = Math.Clamp(maxConcurrency, 1, 32),
             FallbackToHeuristics = llm.FallbackToHeuristics,
         };
     }
@@ -104,6 +113,7 @@ public static class AppConfigStore
             "model": "gpt-4o-mini",
             "timeoutSeconds": 120,
             "maxCharsPerRequest": 12000,
+            "maxConcurrency": 4,
             "fallbackToHeuristics": true
           },
           "ocr": {
