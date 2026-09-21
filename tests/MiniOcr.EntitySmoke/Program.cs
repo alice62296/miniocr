@@ -95,6 +95,38 @@ AssertContains(orgTrap.Persons, "周杰", "org trap real person");
 AssertTrue(!orgTrap.Persons.Any(p => p.Name == "李宁"), "should not extract 李宁 from 李宁体育用品有限公司");
 
 Console.WriteLine();
+Console.WriteLine("=== ChallengeResultMapper / originText ===");
+
+string otPage =
+    "法定代表人或其委托代理人：　游春燕（签字或盖章）正本成都交子商圈物业服务有限公司2026年度一标段（写字楼、";
+List<string> originsPerson = ChallengeResultMapper.BuildOriginTexts(otPage, "游春燕");
+AssertTrue(originsPerson.Count == 1, "person origin count");
+AssertTrue(originsPerson[0].Length is >= 10 and <= 100, $"person origin len={originsPerson[0].Length}");
+AssertTrue(originsPerson[0].Contains("游春燕", StringComparison.Ordinal), "person origin contains name");
+
+List<string> originsCo = ChallengeResultMapper.BuildOriginTexts(otPage, "成都交子商圈物业服务有限公司");
+AssertTrue(originsCo.Count == 1, "company origin count");
+AssertTrue(originsCo[0].Length is >= 10 and <= 100, $"company origin len={originsCo[0].Length}");
+
+ChallengeFileResult mapped = ChallengeResultMapper.BuildFileResult(
+    "f1",
+    [new OcrPageResult { Page = 1, Text = otPage }],
+    ["成都交子商圈物业服务有限公司"],
+    ["游春燕"]);
+AssertTrue(mapped.FileId == "f1", "fileId");
+AssertTrue(mapped.Pages.Count == 1, "one page");
+ChallengeRule? b04 = mapped.Pages[0].RuleList.FirstOrDefault(r => r.RuleCode == "B04");
+ChallengeRule? b06 = mapped.Pages[0].RuleList.FirstOrDefault(r => r.RuleCode == "B06");
+AssertTrue(b04 is not null && b04.RuleItemList.Count == 1 && b04.RuleItemList[0].PersonName == "游春燕", "B04 personName");
+AssertTrue(b04!.RuleItemList[0].Count == 1, "B04 count");
+AssertTrue(b06 is not null && b06.RuleItemList.Count == 1 && b06.RuleItemList[0].CompanyName == "成都交子商圈物业服务有限公司", "B06 companyName");
+
+// multi occurrence count
+string dup = "张伟出席。再次提到张伟。";
+List<string> dupOrigins = ChallengeResultMapper.BuildOriginTexts(dup, "张伟");
+AssertTrue(dupOrigins.Count == 2, $"dup origins count={dupOrigins.Count}");
+
+Console.WriteLine();
 if (failed == 0)
 {
     Console.WriteLine("All smoke checks passed.");

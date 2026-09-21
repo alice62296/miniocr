@@ -4,6 +4,119 @@
 
 从 URL 并发下载 PDF（≤300 MB），按页流式栅格化 + OCR（最多约 2000 页），返回每页文本、耗时，以及 **公司名 / 人名** JSON（优先 OpenAI 兼容 LLM NER，可回退启发式）。模型为 PP-OCRv6 **ChineseV6Tiny**。
 
+## 竞赛协议（serviceUrl）
+
+平台**无登录/无 token**调用本服务；填入竞赛后台的 **serviceUrl** 推荐：
+
+```text
+https://<你的公网主机>:5080/challenge
+```
+
+也支持把 serviceUrl 填成根路径 `https://<host>:5080/`（`POST /` 与 `POST /challenge` 等价）。调试用同步接口 `POST /ocr` 仍保留；`GET /health` 用于探活。
+
+### 平台 → 本服务（须快速返回 200）
+
+`POST {serviceUrl}`，`Content-Type: application/json`：
+
+```json
+{
+  "teamId": 123,
+  "key": "回调凭证（无横线 uuid）",
+  "callbackUrl": "https://agw.yzwqa.cn/ifs/cloudsound/api/votenologin/challenge/callback",
+  "files": [
+    { "fileId": "f1", "url": "https://...pdf" }
+  ]
+}
+```
+
+成功受理时立即返回 HTTP 200：
+
+```json
+{ "ok": true }
+```
+
+随后在后台异步：按 `files[]` 下载 PDF → OCR → 按页抽取人员/公司 → `POST callbackUrl`。支持一次请求多个文件。不要在请求线程上跑完整 OCR。
+
+### 本服务 → 平台回调
+
+```json
+{
+  "teamId": 123,
+  "key": "与下发时相同的 key",
+  "result": [
+    {
+      "fileId": "f1",
+      "pages": [
+        {
+          "page": 1,
+          "ruleList": [
+            {
+              "ruleCode": "B04",
+              "ruleName": "人员名称",
+              "ruleItemList": [
+                {
+                  "personName": "游春燕",
+                  "count": 1,
+                  "originText": ["法定代表人或其委托代理人：　游春燕（签字或盖章）"]
+                }
+              ]
+            },
+            {
+              "ruleCode": "B06",
+              "ruleName": "公司名称",
+              "ruleItemList": [
+                {
+                  "companyName": "成都交子商圈物业服务有限公司",
+                  "count": 1,
+                  "originText": ["正本成都交子商圈物业服务有限公司2026年度一标段（写字楼、"]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+规则约定：
+
+| ruleCode | ruleName | 条目字段 |
+| --- | --- | --- |
+| B04 | 人员名称 | `personName` |
+| B06 | 公司名称 | `companyName` |
+
+- `count`：该名字在**该页**出现次数  
+- `originText`：每次命中附近截取的原文片段数组，每段 **10–100 字**（居中扩窗，边界不足则向另一侧借）  
+- 实体来自 LLM NER（若已配置）或启发式；若 LLM 只给名字，会回扫页文本统计 `count` 并生成 `originText`  
+- 回调失败会重试数次；日志只记录 `keyPresent`，不打印完整 key  
+
+吞吐：后台队列 + 最多 2 路并行 OCR 任务，避免在约 5 QPM 下把进程打崩。目标场景：约 2000 页 PDF、准确率 90%+、≤5 分钟/份（视机器与 DPI/LLM 而定）。
+
+本地冒烟示例（假回调监听）：
+
+```bash
+# 终端 A：假回调（9099）
+python3 -c '
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        n=int(self.headers.get("Content-Length",0)); body=self.rfile.read(n)
+        print(body.decode()[:2000]); self.send_response(200); self.end_headers(); self.wfile.write(b"{\"ok\":true}")
+    def log_message(self,*a): pass
+HTTPServer(("127.0.0.1",9099),H).serve_forever()
+'
+
+# 终端 B：静态 PDF
+python3 -m http.server 8000 --directory samples
+
+# 终端 C：下发挑战（服务已在 5080）
+curl -sS -X POST http://127.0.0.1:5080/challenge \
+  -H "Content-Type: application/json" \
+  -d "{\"teamId\":123,\"key\":\"testkey\",\"callbackUrl\":\"http://127.0.0.1:9099/cb\",\"files\":[{\"fileId\":\"f1\",\"url\":\"http://127.0.0.1:8000/sample-multipage.pdf\"}]}"
+```
+
 ## 环境要求
 
 - 目标平台：Windows / Linux / macOS（x64 与 ARM64）；本仓库 CI 产出多平台 Native AOT 包
@@ -234,8 +347,11 @@ curl -sS http://127.0.0.1:5080/health
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
+| `POST` | `/challenge` | **竞赛 serviceUrl（推荐）**：异步受理，见上文「竞赛协议」 |
+| `POST` | `/` | 与 `/challenge` 相同（可将 serviceUrl 填根路径） |
 | `GET` | `/health` | 健康、模型与当前旋钮 |
-| `POST` | `/ocr` | Body: `{"url":"https://.../file.pdf","dpi":96}` |
+| `POST` | `/ocr` | 调试用同步 OCR：`{"url":"https://.../file.pdf","dpi":96}` |
+| `GET` | `/` | 纯文本接口说明 |
 
 ## 项目结构
 
@@ -243,7 +359,7 @@ curl -sS http://127.0.0.1:5080/health
 miniocr/
   MiniOcr.csproj          # Web + PublishAot + IlcInstructionSet=avx2（仅 x64）
   .github/workflows/publish.yml  # 多平台 AOT 打包
-  Program.cs              # SlimBuilder + /ocr /health
+  Program.cs              # SlimBuilder + /challenge /ocr /health
   AppJsonContext.cs       # AOT JSON
   Models/OcrModels.cs
   Services/
@@ -255,6 +371,8 @@ miniocr/
     OcrEngine.cs
     PdfOcrPipeline.cs
     EntityExtractor.cs    # 启发式回退
+    ChallengeJobService.cs # 竞赛异步队列 + 回调
+    ChallengeResultMapper.cs # 按页 B04/B06 + originText
   tests/MiniOcr.EntitySmoke/  # 实体抽取冒烟
   samples/sample-multipage.pdf
   README.md

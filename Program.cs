@@ -17,6 +17,12 @@ builder.Services.AddHttpClient<ParallelPdfDownloader>(client =>
     client.MaxResponseContentBufferSize = 16 * 1024 * 1024;
 });
 
+builder.Services.AddHttpClient(ChallengeJobService.CallbackHttpClientName, client =>
+{
+    client.Timeout = TimeSpan.FromMinutes(2);
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("MiniOcr/1.0 (+challenge-callback)");
+});
+
 using ILoggerFactory bootstrapLogs = LoggerFactory.Create(logging =>
 {
     logging.AddConsole();
@@ -69,6 +75,8 @@ builder.Services.AddSingleton<LlmEntityExtractor>(sp =>
 });
 
 builder.Services.AddSingleton<PdfOcrPipeline>();
+builder.Services.AddSingleton<ChallengeJobService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<ChallengeJobService>());
 
 WebApplication app = builder.Build();
 ILogger logger = app.Logger;
@@ -103,6 +111,124 @@ app.MapGet("/health", (OcrEngine ocr, LlmRuntimeConfig llm, OcrRuntimeConfig cfg
         LlmFallbackToHeuristics = llm.FallbackToHeuristics,
     },
     AppJsonContext.Default.HealthResponse));
+
+async Task<IResult> HandleChallengeAsync(
+    HttpRequest httpRequest,
+    ChallengeJobService jobs,
+    CancellationToken ct)
+{
+    ChallengeRequest? body;
+    try
+    {
+        body = await httpRequest.ReadFromJsonAsync(AppJsonContext.Default.ChallengeRequest, ct)
+            .ConfigureAwait(false);
+    }
+    catch (Exception ex)
+    {
+        logger.LogWarning(ex, "Challenge JSON parse failed");
+        return Results.Json(
+            new ChallengeAckResponse { Ok = false, Error = "Invalid JSON body." },
+            AppJsonContext.Default.ChallengeAckResponse,
+            statusCode: StatusCodes.Status400BadRequest);
+    }
+
+    if (body is null)
+    {
+        return Results.Json(
+            new ChallengeAckResponse { Ok = false, Error = "Empty body." },
+            AppJsonContext.Default.ChallengeAckResponse,
+            statusCode: StatusCodes.Status400BadRequest);
+    }
+
+    if (string.IsNullOrWhiteSpace(body.Key) ||
+        string.IsNullOrWhiteSpace(body.CallbackUrl) ||
+        body.Files is null ||
+        body.Files.Count == 0)
+    {
+        return Results.Json(
+            new ChallengeAckResponse
+            {
+                Ok = false,
+                Error = "Required: key, callbackUrl, files[] (each with fileId + url).",
+            },
+            AppJsonContext.Default.ChallengeAckResponse,
+            statusCode: StatusCodes.Status400BadRequest);
+    }
+
+    if (!Uri.TryCreate(body.CallbackUrl, UriKind.Absolute, out Uri? cb) ||
+        (cb.Scheme != Uri.UriSchemeHttp && cb.Scheme != Uri.UriSchemeHttps))
+    {
+        return Results.Json(
+            new ChallengeAckResponse { Ok = false, Error = "callbackUrl must be absolute http(s)." },
+            AppJsonContext.Default.ChallengeAckResponse,
+            statusCode: StatusCodes.Status400BadRequest);
+    }
+
+    List<ChallengeFileRef> files = [];
+    foreach (ChallengeFileRef f in body.Files)
+    {
+        if (string.IsNullOrWhiteSpace(f.Url) || string.IsNullOrWhiteSpace(f.FileId))
+            continue;
+        if (!Uri.TryCreate(f.Url, UriKind.Absolute, out Uri? fu) ||
+            (fu.Scheme != Uri.UriSchemeHttp && fu.Scheme != Uri.UriSchemeHttps))
+            continue;
+        files.Add(f);
+    }
+
+    if (files.Count == 0)
+    {
+        return Results.Json(
+            new ChallengeAckResponse { Ok = false, Error = "No valid files (need fileId + http(s) url)." },
+            AppJsonContext.Default.ChallengeAckResponse,
+            statusCode: StatusCodes.Status400BadRequest);
+    }
+
+    ChallengeJob job = new()
+    {
+        TeamId = body.TeamId,
+        Key = body.Key.Trim(),
+        CallbackUrl = body.CallbackUrl.Trim(),
+        Files = files,
+    };
+
+    // Non-blocking enqueue when possible; if queue full, brief wait then still ack
+    // (platform requires fast 200 — do not run OCR on this thread).
+    if (!jobs.TryEnqueue(job))
+    {
+        using CancellationTokenSource waitCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        waitCts.CancelAfter(TimeSpan.FromSeconds(2));
+        try
+        {
+            await jobs.EnqueueAsync(job, waitCts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            logger.LogWarning(
+                "Challenge queue full; rejecting teamId={TeamId}, keyPresent=true, files={Count}",
+                job.TeamId,
+                job.Files.Count);
+            return Results.Json(
+                new ChallengeAckResponse { Ok = false, Error = "Server busy; retry shortly." },
+                AppJsonContext.Default.ChallengeAckResponse,
+                statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
+    }
+
+    logger.LogInformation(
+        "Challenge accepted: teamId={TeamId}, keyPresent=true, files={Count}, queuedApprox={Queued}",
+        job.TeamId,
+        job.Files.Count,
+        jobs.QueuedApprox);
+
+    return Results.Json(
+        new ChallengeAckResponse { Ok = true },
+        AppJsonContext.Default.ChallengeAckResponse);
+}
+
+// Competition primary serviceUrl path (no auth).
+app.MapPost("/challenge", HandleChallengeAsync);
+// Also accept POST / so serviceUrl can be the bare base URL.
+app.MapPost("/", HandleChallengeAsync);
 
 app.MapPost("/ocr", async Task<IResult> (
     HttpRequest httpRequest,
@@ -182,7 +308,10 @@ app.MapPost("/ocr", async Task<IResult> (
 
 app.MapGet("/", () => Results.Text(
     "MiniOcr AOT API\n" +
-    "POST /ocr  {\"url\":\"https://.../file.pdf\",\"dpi\":96}\n" +
+    "POST /challenge  ← competition serviceUrl (also POST /)\n" +
+    "  {\"teamId\":123,\"key\":\"...\",\"callbackUrl\":\"https://...\",\"files\":[{\"fileId\":\"f1\",\"url\":\"https://...pdf\"}]}\n" +
+    "  → HTTP 200 {\"ok\":true} immediately; results POSTed async to callbackUrl\n" +
+    "POST /ocr        debug sync OCR {\"url\":\"https://.../file.pdf\",\"dpi\":96}\n" +
     "GET  /health\n" +
     $"Config: {configPath}\n" +
     "Env OCR: MINIOCR_ENGINES MINIOCR_DPI MINIOCR_LINE_WORKERS MINIOCR_DET_THREADS MINIOCR_USE_CLS MINIOCR_RASTER_WORKERS\n" +
