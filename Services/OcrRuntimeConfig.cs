@@ -1,10 +1,11 @@
+using MiniOcr.Models;
+
 namespace MiniOcr.Services;
 
 /// <summary>
-/// Throughput knobs from environment (startup) with sensible 8-core defaults aimed at &lt;5 min / 2000 pages.
-/// Override: MINIOCR_ENGINES, MINIOCR_DPI, MINIOCR_LINE_WORKERS, MINIOCR_DET_THREADS,
-/// MINIOCR_USE_CLS, MINIOCR_RASTER_WORKERS, MINIOCR_REC_BATCH, MINIOCR_DET_LIMIT_SIDE.
-/// Per-request DPI can still override via JSON body <c>dpi</c> or query <c>?dpi=</c>.
+/// Throughput knobs from AppData config.json + environment overrides.
+/// Env (MINIOCR_*) wins over file for OCR. Auto-scales from ProcessorCount when
+/// <c>autoScaleFromCpu</c> is true and engines/workers are unset.
 /// </summary>
 public sealed class OcrRuntimeConfig
 {
@@ -16,28 +17,70 @@ public sealed class OcrRuntimeConfig
     public int RasterWorkerCount { get; init; }
     public int RecBatchLines { get; init; }
     public int DetLimitSideLength { get; init; }
+    public bool AutoScaleFromCpu { get; init; }
+    public int ProcessorCount { get; init; }
 
-    public static OcrRuntimeConfig FromEnvironment()
+    /// <summary>Load using env only (legacy / tests).</summary>
+    public static OcrRuntimeConfig FromEnvironment() =>
+        FromAppConfig(new AppConfigFile());
+
+    /// <summary>
+    /// Merge file OCR section with env overrides and CPU auto-scale.
+    /// Priority: env MINIOCR_* &gt; explicit file values &gt; auto-scale defaults.
+    /// </summary>
+    public static OcrRuntimeConfig FromAppConfig(AppConfigFile file)
     {
         int cores = Math.Max(1, Environment.ProcessorCount);
-        // Page-parallel engines: default half the cores (4 on 8-core), capped at 8.
-        int engines = ReadInt("MINIOCR_ENGINES", Math.Clamp(cores / 2, 4, 8));
+        OcrFileConfig ocr = file.Ocr ?? new OcrFileConfig();
+        bool autoScale = ocr.AutoScaleFromCpu;
+
+        AutoScaleDefaults scaled = ComputeAutoScale(cores);
+
+        int engines = ResolveInt(
+            envName: "MINIOCR_ENGINES",
+            fileValue: ocr.Engines,
+            autoDefault: scaled.Engines,
+            autoScale: autoScale,
+            fixedFallback: scaled.Engines);
         engines = Math.Clamp(engines, 1, 16);
 
-        // Keep intra-page threads low so engines × workers does not thrash an 8-core box.
-        int lineDefault = engines >= 6 ? 2 : Math.Clamp(cores, 1, 4);
-        int detDefault = engines >= 4 ? 2 : Math.Clamp(cores, 1, 8);
-        int line = Math.Clamp(ReadInt("MINIOCR_LINE_WORKERS", lineDefault), 1, 16);
-        int det = Math.Clamp(ReadInt("MINIOCR_DET_THREADS", detDefault), 1, 16);
+        // Recompute line/det defaults against the *resolved* engine count so
+        // engines*(line+det) stays near 1–1.5× cores even when engines is overridden.
+        AutoScaleDefaults forEngines = ComputeWorkersForEngines(cores, engines);
 
-        // Default 96 DPI — balanced ZH+EN readability vs throughput; ~(96/150)^2 ≈ 41% pixels vs baseline 150.
-        int dpi = Math.Clamp(ReadInt("MINIOCR_DPI", 96), 36, 300);
+        int line = ResolveInt(
+            "MINIOCR_LINE_WORKERS",
+            ocr.LineWorkers,
+            forEngines.LineWorkers,
+            autoScale,
+            forEngines.LineWorkers);
+        line = Math.Clamp(line, 1, 16);
 
-        bool useCls = ReadBool("MINIOCR_USE_CLS", false);
+        int det = ResolveInt(
+            "MINIOCR_DET_THREADS",
+            ocr.DetThreads,
+            forEngines.DetThreads,
+            autoScale,
+            forEngines.DetThreads);
+        det = Math.Clamp(det, 1, 16);
 
-        // Parallel PDF raster producers (one PdfDocument.Load + ToImages stream each).
-        // Measured sweet spot is 2–4 on 8-core; >4 adds contention with OCR. Default min(engines, 4).
-        int raster = Math.Clamp(ReadInt("MINIOCR_RASTER_WORKERS", Math.Min(engines, 4)), 1, 8);
+        int dpiFallback = ocr.Dpi ?? 96;
+        int dpi = Math.Clamp(ReadInt("MINIOCR_DPI", dpiFallback), 36, 300);
+
+        bool useClsFile = ocr.UseCls ?? false;
+        bool useCls = ReadBool("MINIOCR_USE_CLS", useClsFile);
+
+        int rasterDefault = autoScale
+            ? forEngines.RasterWorkers
+            : Math.Clamp(Math.Min(engines, 4), 1, 8);
+        int raster = ResolveInt(
+            "MINIOCR_RASTER_WORKERS",
+            ocr.RasterWorkers,
+            rasterDefault,
+            autoScale,
+            rasterDefault);
+        raster = Math.Clamp(raster, 1, 8);
+
         int recBatch = Math.Clamp(ReadInt("MINIOCR_REC_BATCH", 8), 1, 64);
         int detLimit = Math.Clamp(ReadInt("MINIOCR_DET_LIMIT_SIDE", 960), 64, 4096);
 
@@ -51,7 +94,74 @@ public sealed class OcrRuntimeConfig
             RasterWorkerCount = raster,
             RecBatchLines = recBatch,
             DetLimitSideLength = detLimit,
+            AutoScaleFromCpu = autoScale,
+            ProcessorCount = cores,
         };
+    }
+
+    /// <summary>
+    /// New curve (2–64 cores): engines = Clamp(cores/2, 1, min(16, cores)).
+    /// Old awkward default forced min 4 engines even on 2-core boxes.
+    /// Workers chosen so engines*(line+det) ≈ 1.0–1.5× cores.
+    /// raster = Clamp(min(engines, cores/2), 1, 8).
+    /// </summary>
+    public static AutoScaleDefaults ComputeAutoScale(int cores)
+    {
+        cores = Math.Max(1, cores);
+        int engines = Math.Clamp(cores / 2, 1, Math.Min(16, cores));
+        return ComputeWorkersForEngines(cores, engines) with { Engines = engines };
+    }
+
+    public static AutoScaleDefaults ComputeWorkersForEngines(int cores, int engines)
+    {
+        cores = Math.Max(1, cores);
+        engines = Math.Clamp(engines, 1, 16);
+
+        // Target total OCR threads ≈ 1.25× cores (band 1.0–1.5×).
+        int target = Math.Max(engines * 2, (int)Math.Round(cores * 1.25));
+        int maxBudget = Math.Max(engines * 2, (int)Math.Floor(cores * 1.5));
+        target = Math.Min(target, maxBudget);
+
+        int perEngine = Math.Max(2, (target + engines - 1) / engines);
+        // Prefer slightly more line workers than det (CLS/REC parallel vs DET intra-op).
+        int line = Math.Clamp((perEngine + 1) / 2, 1, 8);
+        int det = Math.Clamp(perEngine - line, 1, 8);
+
+        // Shrink if still oversubscribed.
+        while (engines * (line + det) > maxBudget && (line > 1 || det > 1))
+        {
+            if (line >= det && line > 1)
+                line--;
+            else if (det > 1)
+                det--;
+            else
+                break;
+        }
+
+        int raster = Math.Clamp(Math.Min(engines, Math.Max(1, cores / 2)), 1, 8);
+
+        return new AutoScaleDefaults
+        {
+            Engines = engines,
+            LineWorkers = line,
+            DetThreads = det,
+            RasterWorkers = raster,
+        };
+    }
+
+    private static int ResolveInt(
+        string envName,
+        int? fileValue,
+        int autoDefault,
+        bool autoScale,
+        int fixedFallback)
+    {
+        string? raw = Environment.GetEnvironmentVariable(envName);
+        if (int.TryParse(raw, out int fromEnv))
+            return fromEnv;
+        if (fileValue is int fv)
+            return fv;
+        return autoScale ? autoDefault : fixedFallback;
     }
 
     private static int ReadInt(string name, int fallback)
@@ -74,3 +184,9 @@ public sealed class OcrRuntimeConfig
         return fallback;
     }
 }
+
+public readonly record struct AutoScaleDefaults(
+    int Engines,
+    int LineWorkers,
+    int DetThreads,
+    int RasterWorkers);

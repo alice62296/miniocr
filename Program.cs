@@ -22,22 +22,51 @@ using ILoggerFactory bootstrapLogs = LoggerFactory.Create(logging =>
     logging.AddConsole();
     logging.SetMinimumLevel(LogLevel.Information);
 });
+ILogger bootstrapLogger = bootstrapLogs.CreateLogger("MiniOcr.Startup");
 
-OcrRuntimeConfig runtimeConfig = OcrRuntimeConfig.FromEnvironment();
+string configPath = AppConfigStore.GetConfigPath();
+AppConfigFile appConfig = AppConfigStore.LoadOrCreate(bootstrapLogger);
+LlmRuntimeConfig llmConfig = AppConfigStore.ResolveLlm(appConfig);
+OcrRuntimeConfig runtimeConfig = OcrRuntimeConfig.FromAppConfig(appConfig);
 
 Console.WriteLine($"Runtime: {RuntimeInformation.FrameworkDescription}");
 Console.WriteLine($"OS: {RuntimeInformation.OSDescription} ({RuntimeInformation.OSArchitecture})");
+Console.WriteLine($"Config: {configPath}");
+Console.WriteLine(
+    $"CPU auto-scale: ProcessorCount={runtimeConfig.ProcessorCount}, autoScaleFromCpu={runtimeConfig.AutoScaleFromCpu}");
 Console.WriteLine(
     $"OCR knobs: engines={runtimeConfig.EngineCount}, dpi={runtimeConfig.DefaultDpi}, " +
     $"lineWorkers={runtimeConfig.LineWorkerCount}, detThreads={runtimeConfig.DetIntraOpThreads}, " +
     $"useCls={runtimeConfig.UseDirectionClassification}, rasterWorkers={runtimeConfig.RasterWorkerCount}");
+Console.WriteLine(
+    $"LLM NER: enabled={llmConfig.Enabled}, usable={llmConfig.IsUsable}, " +
+    $"model={llmConfig.Model}, baseUrl={llmConfig.BaseUrl}, " +
+    $"fallbackToHeuristics={llmConfig.FallbackToHeuristics}, apiKey={(string.IsNullOrEmpty(llmConfig.ApiKey) ? "(empty)" : "(set)")}");
 Console.WriteLine("Loading ChineseV6Tiny OCR models...");
 
 OcrEngine engine = await OcrEngine.CreateAsync(
     bootstrapLogs.CreateLogger<OcrEngine>(),
     runtimeConfig);
 builder.Services.AddSingleton(runtimeConfig);
+builder.Services.AddSingleton(llmConfig);
 builder.Services.AddSingleton(engine);
+
+builder.Services.AddHttpClient(nameof(LlmEntityExtractor), (sp, client) =>
+{
+    LlmRuntimeConfig cfg = sp.GetRequiredService<LlmRuntimeConfig>();
+    client.Timeout = TimeSpan.FromSeconds(cfg.TimeoutSeconds);
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("MiniOcr/1.0 (+LLM-NER)");
+});
+builder.Services.AddSingleton<LlmEntityExtractor>(sp =>
+{
+    IHttpClientFactory factory = sp.GetRequiredService<IHttpClientFactory>();
+    HttpClient http = factory.CreateClient(nameof(LlmEntityExtractor));
+    return new LlmEntityExtractor(
+        http,
+        sp.GetRequiredService<LlmRuntimeConfig>(),
+        sp.GetRequiredService<ILogger<LlmEntityExtractor>>());
+});
+
 builder.Services.AddSingleton<PdfOcrPipeline>();
 
 WebApplication app = builder.Build();
@@ -49,13 +78,13 @@ lifetime.ApplicationStopping.Register(() =>
     engine.DisposeAsync().AsTask().GetAwaiter().GetResult();
 });
 
-app.MapGet("/health", (OcrEngine ocr) => Results.Json(
+app.MapGet("/health", (OcrEngine ocr, LlmRuntimeConfig llm, OcrRuntimeConfig cfg) => Results.Json(
     new HealthResponse
     {
         Status = "ok",
         ModelsLoaded = ocr.IsLoaded,
         Runtime = RuntimeInformation.FrameworkDescription,
-        ProcessorCount = Environment.ProcessorCount,
+        ProcessorCount = cfg.ProcessorCount,
         EngineCount = ocr.EngineCount,
         LineWorkerCount = ocr.LineWorkerCount,
         DetIntraOpThreads = ocr.DetIntraOpThreads,
@@ -64,6 +93,13 @@ app.MapGet("/health", (OcrEngine ocr) => Results.Json(
         RasterWorkerCount = ocr.Config.RasterWorkerCount,
         RecBatchLines = ocr.Config.RecBatchLines,
         DetLimitSideLength = ocr.Config.DetLimitSideLength,
+        AutoScaleFromCpu = cfg.AutoScaleFromCpu,
+        ConfigPath = configPath,
+        LlmEnabled = llm.Enabled,
+        LlmUsable = llm.IsUsable,
+        LlmModel = llm.Model,
+        LlmBaseUrl = llm.BaseUrl,
+        LlmFallbackToHeuristics = llm.FallbackToHeuristics,
     },
     AppJsonContext.Default.HealthResponse));
 
@@ -147,16 +183,22 @@ app.MapGet("/", () => Results.Text(
     "MiniOcr AOT API\n" +
     "POST /ocr  {\"url\":\"https://.../file.pdf\",\"dpi\":96}\n" +
     "GET  /health\n" +
-    "Env: MINIOCR_ENGINES MINIOCR_DPI MINIOCR_LINE_WORKERS MINIOCR_DET_THREADS MINIOCR_USE_CLS MINIOCR_RASTER_WORKERS MINIOCR_REC_BATCH MINIOCR_DET_LIMIT_SIDE\n",
+    $"Config: {configPath}\n" +
+    "Env OCR: MINIOCR_ENGINES MINIOCR_DPI MINIOCR_LINE_WORKERS MINIOCR_DET_THREADS MINIOCR_USE_CLS MINIOCR_RASTER_WORKERS\n" +
+    "Env LLM: MINIOCR_LLM_API_KEY MINIOCR_LLM_BASE_URL MINIOCR_LLM_MODEL\n",
     "text/plain; charset=utf-8"));
 
 string urls = string.Join(", ", app.Urls.DefaultIfEmpty("(default http://localhost:5000)"));
 logger.LogInformation(
-    "MiniOcr ready — engines={Engines}, lineWorkers={LineWorkers}, dpi={Dpi}, useCls={UseCls}, listening={Urls}",
+    "MiniOcr ready — ProcessorCount={Cores}, engines={Engines}, lineWorkers={LineWorkers}, det={Det}, raster={Raster}, dpi={Dpi}, useCls={UseCls}, llmUsable={Llm}, listening={Urls}",
+    runtimeConfig.ProcessorCount,
     engine.EngineCount,
     engine.LineWorkerCount,
+    engine.DetIntraOpThreads,
+    engine.Config.RasterWorkerCount,
     engine.Config.DefaultDpi,
     engine.UseDirectionClassification,
+    llmConfig.IsUsable,
     urls);
 
 await app.RunAsync();

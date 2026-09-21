@@ -11,14 +11,19 @@ public sealed class PdfOcrPipeline
 {
     private readonly OcrEngine _engine;
     private readonly ILogger<PdfOcrPipeline> _logger;
+    private readonly LlmEntityExtractor? _llm;
     private readonly int _pageWindow;
     private readonly int _defaultDpi;
     private readonly int _rasterWorkers;
 
-    public PdfOcrPipeline(OcrEngine engine, ILogger<PdfOcrPipeline> logger)
+    public PdfOcrPipeline(
+        OcrEngine engine,
+        ILogger<PdfOcrPipeline> logger,
+        LlmEntityExtractor? llm = null)
     {
         _engine = engine;
         _logger = logger;
+        _llm = llm;
         _pageWindow = Math.Max(4, engine.EngineCount * 2);
         _defaultDpi = engine.Config.DefaultDpi;
         _rasterWorkers = engine.Config.RasterWorkerCount;
@@ -72,7 +77,6 @@ public sealed class PdfOcrPipeline
             Grayscale: true);
 
         OcrPageResult[] pages = new OcrPageResult[pageCount];
-        EntityAccumulator entityAcc = new();
 
         Channel<(int Index, SKBitmap Bitmap, double RasterMs)> rasterized =
             Channel.CreateBounded<(int, SKBitmap, double)>(new BoundedChannelOptions(_pageWindow)
@@ -126,7 +130,6 @@ public sealed class PdfOcrPipeline
                             RasterizeMs = Math.Round(rasterMs, 1),
                             OcrMs = Math.Round(ocrSw.Elapsed.TotalMilliseconds, 1),
                         };
-                        EntityExtractor.ExtractPage(pageText, index + 1, entityAcc);
 
                         lock (timingLock)
                         {
@@ -150,6 +153,8 @@ public sealed class PdfOcrPipeline
         await producer.ConfigureAwait(false);
         await Task.WhenAll(consumers).ConfigureAwait(false);
 
+        OcrEntities entities = await ExtractEntitiesAsync(pages, ct).ConfigureAwait(false);
+
         totalSw.Stop();
 
         return new OcrResponse
@@ -167,8 +172,36 @@ public sealed class PdfOcrPipeline
                 TotalMs = Math.Round(totalSw.Elapsed.TotalMilliseconds, 1),
             },
             Pages = pages.ToList(),
-            Entities = EntityExtractor.ToEntities(entityAcc),
+            Entities = entities,
         };
+    }
+
+    private async Task<OcrEntities> ExtractEntitiesAsync(OcrPageResult[] pages, CancellationToken ct)
+    {
+        bool preferLlm = _llm is { IsUsable: true };
+        bool fallback = _llm?.Config.FallbackToHeuristics ?? true;
+
+        if (preferLlm)
+        {
+            try
+            {
+                OcrEntities llmEntities = await _llm!.ExtractAsync(pages, ct).ConfigureAwait(false);
+                _logger.LogInformation(
+                    "LLM NER done: companies={Companies}, persons={Persons}",
+                    llmEntities.Companies.Count,
+                    llmEntities.Persons.Count);
+                return llmEntities;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "LLM NER failed; fallbackToHeuristics={Fallback}", fallback);
+                if (!fallback)
+                    return new OcrEntities();
+            }
+        }
+
+        List<string> texts = pages.Select(p => p.Text ?? "").ToList();
+        return EntityExtractor.ExtractFromPages(texts);
     }
 
     private async Task ProduceParallelAsync(

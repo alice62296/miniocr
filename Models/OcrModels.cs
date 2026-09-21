@@ -65,4 +65,11 @@ public sealed class HealthResponse
     public int RasterWorkerCount { get; set; }
     public int RecBatchLines { get; set; }
     public int DetLimitSideLength { get; set; }
+    public bool AutoScaleFromCpu { get; set; }
+    public string ConfigPath { get; set; } = "";
+    public bool LlmEnabled { get; set; }
+    public bool LlmUsable { get; set; }
+    public string LlmModel { get; set; } = "";
+    public string LlmBaseUrl { get; set; } = "";
+    public bool LlmFallbackToHeuristics { get; set; }
 }
