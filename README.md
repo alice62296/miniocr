@@ -127,7 +127,7 @@ curl -sS -X POST http://127.0.0.1:5080/challenge \
 - 目标平台：Windows / Linux / macOS（x64 与 ARM64）；本仓库 CI 产出多平台 Native AOT 包
 - [.NET 11 RC SDK](https://dotnet.microsoft.com/download/dotnet/11.0)
 - Native AOT 需要本机 C 工具链（`gcc` / `clang` + zlib 等）
-- **x64** 正式包启用 **AVX2**（见下方 AOT / CI 说明）；**ARM64** 不使用 AVX2
+- **x64** 两档：默认 **AVX2**（通用）与 **AVX-512 高档**（见下方「SIMD 指令集档位」）；**ARM64** 不设置档位（基线已含 NEON）
 
 ### 安装 .NET 11 RC（Linux）
 
@@ -145,6 +145,7 @@ dotnet --list-sdks
 git clone https://github.com/huiyuanai709/miniocr.git
 cd miniocr
 dotnet publish -c Release -r linux-x64 -o ./artifacts/linux-x64
+# 换档位（默认 avx2）：加 -p:IlcInstructionSet=avx512 / avx512v2 / avxvnni …
 ```
 
 产物目录示例：
@@ -191,7 +192,8 @@ dotnet publish -c Release -r linux-x64 -o ./artifacts/linux-x64-singlefile \
 | 分发形态 | `MiniOcr` + `libSkiaSharp.*` + `libpdfium.*` | **仅** `MiniOcr` 一个文件 |
 | 体积（linux-x64，本机实测） | exe ~26 MB + so ~19 MB | 压缩后约 **~29 MB** |
 | 运行时 | Native AOT | 自包含 JIT（.NET 11） |
-| x64 AVX2 / 竞赛吞吐 | **是（默认保留）** | 否（不走 ILC；勿作竞赛主包） |
+| x64 SIMD 内核 | 由 `IlcInstructionSet` **静态**决定（档位见下） | **运行时自动探测**：AVX2 → AVX-512 → VNNI 都会亮 |
+| 竞赛吞吐 | **高**（AOT + 选定档位，竞赛主包） | 较低（JIT；勿作竞赛主包） |
 | 首次启动 | 直接跑 | 解压原生库到 `~/.net/MiniOcr/` |
 
 运行：
@@ -437,20 +439,66 @@ curl -sS http://127.0.0.1:5080/health
 
 **局限：** 启发式会漏/误；LLM 依赖模型与 OCR 文本质量，竞赛场景请复核关键实体。
 
-## Native AOT 注意（avx2，仅 x64）
+## SIMD 指令集档位（Native AOT，x64）
 
-项目已设置：
+ILC 在**编译期**把指令集烧进二进制（Native AOT 不做运行时派发），所以 `Sdcb.SimdPaddleOCR` 里的 AVX2 / AVX-512 / VNNI 内核**只有编译时列进档位才存在**，否则会被当作死代码裁掉。默认档位 `avx2`：
 
 ```xml
 <PublishAot>true</PublishAot>
-<!-- 仅当 RuntimeIdentifier 含 x64 时启用；ARM64 不会设置 avx2 -->
-<IlcInstructionSet Condition="$([System.String]::Copy('$(RuntimeIdentifier)').Contains('x64'))">avx2</IlcInstructionSet>
+<!-- 仅当 RuntimeIdentifier 含 x64 时启用；ARM64 不设置（基线已含 NEON） -->
+<IlcInstructionSet Condition="'$(IlcInstructionSet)' == '' and $([System.String]::Copy('$(RuntimeIdentifier)').Contains('x64'))">avx2</IlcInstructionSet>
 ```
 
-对 **x64**：**必须**保留 `IlcInstructionSet=avx2`。否则 ILC 按 SSE2 / 128-bit `Vector<T>` 基线编译，`Avx2.IsSupported` 会被折成 `false`，SimdPaddleOCR 的 AVX2 内核整段裁掉，OCR 会慢很多。
+> **别去掉这行。** 一个档位都不设时 ILC 按 SSE2 / 128-bit `Vector<T>` 基线编译，`Avx2.IsSupported`、`Avx512F.IsSupported` 都会被折成 `false`（本机实测确认），AVX2 / AVX-512 内核整段裁掉，OCR 明显变慢。
 
-- **无 AVX2 的 x64 CPU**：不要下载/运行带 AVX2 的 x64 包（可能无法启动）。请自行去掉 `IlcInstructionSet` 后本地发布，或改用非 AOT。
-- **ARM64**（`linux-arm64` / `osx-arm64`）：不设置 `IlcInstructionSet`（基线含 NEON），与 x64 AVX2 包无关。macOS **仅发布 Apple Silicon（`osx-arm64`）**，不再构建 Intel `osx-x64`。
+用 `-p:IlcInstructionSet=<档位>` 覆盖（命令行属性优先级最高，会盖过 csproj 默认）：
+
+```bash
+dotnet publish -c Release -r linux-x64 --self-contained true \
+  -p:IlcInstructionSet=avx512v2 -o ./artifacts/linux-x64-avx512v2
+```
+
+### CI 产出的档位（x64 两档）
+
+| 产物后缀 | `IlcInstructionSet` | 目标 CPU | 参考延迟（本机实测） |
+| --- | --- | --- | --- |
+| （无） | `avx2` | Haswell（2013）及以后 | 382.7 ms/页 |
+| `-avx512v2` | `avx512v2` | Ice Lake / Tiger Lake / Zen 4-5 / Sapphire Rapids 量级 | **246.8 ms/页（快约 35%）** |
+
+基准口径：`samples/sample-multipage.pdf` 第 1 页 @ 96 DPI 灰度 + AA=None（793×1122），ChineseV6Tiny、单引擎、`LineWorkerCount=2` / `DetIntraOpThreads=1` / CLS off；warmup 8 次后取 20 次 p50。机器 i7-1165G7（4C/8T, Tiger Lake），绝对值为该机数值，**只看相对差**。
+
+同口径其它档位（本机实测，未出 CI 包）：
+
+| 档位 | 延迟/页 | 备注 |
+| --- | --- | --- |
+| `avx512` | 289.3 ms | -24%，但比 `avx512v2` 慢且并不更通用 |
+| `avx512v3` | 245.2 ms | 与 `avx512v2` 持平，但要求更新的 CPU，不划算 |
+| `avxvnni` | 拒绝启动 | 本机缺少该指令集 → 说明 VNNI 档位不可做默认 |
+| `native` | 卡死 | 构建机自动探测；**不建议**（产物绑死构建机，且实测有风险） |
+| 非 AOT（JIT） | 432.7 ms | 运行时自动探测，但整体比 AOT 慢 13% |
+
+档位名就是 ILC `--instruction-set` 的名字，需要别的档位直接用同一行覆盖构建：
+
+```bash
+dotnet publish -c Release -r linux-x64 --self-contained true \
+  -p:IlcInstructionSet=avx512v3 -o ./artifacts/linux-x64-avx512v3
+```
+
+（`x86-64-v3` 在本库上实测点亮的指令集合与 `avx2` 一致；`avx10v1` / `avx10v2` 对应 Granite Rapids 及更晚的硬件，目前没必要出包。）
+
+### 档位不匹配不会崩，会明确报错
+
+AOT 产物**启动时自带 CPU 能力检查**。档位高于 CPU 时不会执行非法指令，而是打印并退出：
+
+```
+The current CPU is missing one or more of the required instruction sets.
+```
+
+所以多档位并存是安全的，试错成本只是一次启动失败。
+
+- **ARM64**（`linux-arm64` / `osx-arm64`）：不设置 `IlcInstructionSet`（基线已含 NEON）。本库的 ARM 内核只有 `AdvSimd`、没有 SVE，故未出额外 ARM 档位；需要时可用同样的 `-p:IlcInstructionSet=armv8.2-a` 自建。macOS **仅发布 Apple Silicon（`osx-arm64`）**，不再构建 Intel `osx-x64`。
+- **不是所有机器都能跑最高档**：`avx512v2` 在较老的 x64（无 AVX-512）上会在启动时报错退出，此时用无后缀的 `avx2` 包。
+- **非 AOT 单文件包不做档位**：JIT 在运行时探测 CPU，AVX2 / AVX-512 / VNNI 都会自动亮（本机实测 `Avx512F.IsSupported = true`），代价是整体比 AOT 慢。
 - AOT 禁用反射密集 API；本项目使用 `JsonSerializerContext` + `WebApplication.CreateSlimBuilder`。
 
 ## 下载 CI 产物（GitHub Actions）
@@ -458,14 +506,15 @@ curl -sS http://127.0.0.1:5080/health
 推送到 `main`、手动 `workflow_dispatch`，或发布 Release / 打 `v*` 标签时，工作流 [`.github/workflows/publish.yml`](.github/workflows/publish.yml) 会为各 RID 构建 Native AOT 并上传制品。
 
 1. 打开仓库 **Actions** → 选中 **Publish Native AOT** 某次成功运行。
-2. 在 **Artifacts** 下载对应平台 zip，名称形如：
-   - `miniocr-win-x64` / `miniocr-linux-x64`（**AOT + AVX2**，竞赛推荐）
-   - `miniocr-osx-arm64`（**Apple Silicon only**）/ `miniocr-linux-arm64`（AOT，**无 AVX2**）
-   - `miniocr-win-x64-singlefile` / `miniocr-linux-x64-singlefile`（**真正单文件**，非 AOT，首次运行解压原生库）
+2. 在 **Artifacts** 下载对应平台 zip。x64 每个 SIMD 档位各一个，挑匹配 CPU 的档位（档位含义见 [SIMD 指令集档位](#simd-指令集档位native-aotx64)）：
+   - `miniocr-win-x64` / `miniocr-linux-x64`（AOT，**`avx2` 档，最通用**，竞赛默认）
+   - `miniocr-win-x64-avx512v2` / `miniocr-linux-x64-avx512v2`（AOT，**最高档，实测快约 35%**，需 CPU 支持 AVX-512）
+   - `miniocr-osx-arm64`（**Apple Silicon only**）/ `miniocr-linux-arm64`（AOT，NEON 基线）
+   - `miniocr-win-x64-singlefile` / `miniocr-linux-x64-singlefile`（**真正单文件**，非 AOT，运行时自动探测 SIMD）
    - 不再提供 `osx-x64` / Intel Mac 包
 3. 若通过 **Release** / `v*` 标签触发，zip 也会尽量挂到该 GitHub Release 上，可直接从 Releases 页下载。
 
-**AOT zip：** 解压后含可执行文件 + 原生依赖（`libSkiaSharp` / `pdfium` 的 `.dll` / `.so` / `.dylib`），以及示例 PDF（若打包时存在）；x64 包要求 CPU 支持 AVX2。  
+**AOT zip：** 解压后含可执行文件 + 原生依赖（`libSkiaSharp` / `pdfium` 的 `.dll` / `.so` / `.dylib`），以及示例 PDF（若打包时存在）；x64 包要求 CPU 满足所选的 SIMD 档位，不满足会在启动时报错退出。  
 **单文件 zip：** 解压后通常只有一个 `MiniOcr`（或 `MiniOcr.exe`），拷走即可运行。
 
 ## 架构与内存策略

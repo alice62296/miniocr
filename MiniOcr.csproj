@@ -8,10 +8,14 @@
     <RootNamespace>MiniOcr</RootNamespace>
     <NoWarn>$(NoWarn);CA1416;IL2026;IL3050</NoWarn>
 
-    <!-- Native AOT: IlcInstructionSet=avx2 is required for SimdPaddleOCR speed on x64 only.
-         ARM64 must NOT set avx2 (uses NEON baseline). -->
+    <!-- Native AOT. ILC bakes the CPU instruction set in at compile time (it does not
+         dispatch at run time), so SimdPaddleOCR's AVX2 / AVX-512 / VNNI kernels only
+         exist when the matching tier is listed here. x64 default = avx2 (Haswell+);
+         raise it per host, e.g. -p:IlcInstructionSet=avx512v2. Leaving it empty falls
+         back to the SSE2 baseline and trims every AVX2/AVX-512 kernel.
+         ARM64 must NOT set avx2 (baseline already includes NEON). -->
     <PublishAot>true</PublishAot>
-    <IlcInstructionSet Condition="$([System.String]::Copy('$(RuntimeIdentifier)').Contains('x64'))">avx2</IlcInstructionSet>
+    <IlcInstructionSet Condition="'$(IlcInstructionSet)' == '' and $([System.String]::Copy('$(RuntimeIdentifier)').Contains('x64'))">avx2</IlcInstructionSet>
     <OptimizationPreference>Speed</OptimizationPreference>
     <InvariantGlobalization>false</InvariantGlobalization>
     <StripSymbols>true</StripSymbols>

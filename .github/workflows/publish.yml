@@ -1,7 +1,22 @@
 # Native AOT packaging for MiniOCR across major platforms.
-# Project "async2" request means AVX2 (IlcInstructionSet=avx2) for x64 SimdPaddleOCR, NOT async.
-# Optional MiniOcrSingleFile=true jobs produce a true one-binary (non-AOT) package that
-# self-extracts libSkiaSharp / pdfium on first run — slower than AOT, for convenience only.
+#
+# x64 AOT artifacts come in two SIMD tiers. ILC bakes the CPU instruction set in at
+# compile time (Native AOT does not dispatch at run time), so SimdPaddleOCR's AVX2 /
+# AVX-512 kernels only exist when the matching tier is compiled in:
+#
+#   (unsuffixed)  IlcInstructionSet=avx2      Haswell (2013)+, portable default
+#   -avx512v2     IlcInstructionSet=avx512v2  AVX-512; measured ~35% faster per page
+#
+# A binary whose tier the CPU cannot satisfy is caught by the runtime's startup check
+# and exits with "The current CPU is missing one or more of the required instruction
+# sets." Other ILC names (avx512, avx512v3, avxvnni, avx10v1, x86-64-v4, ...) build the
+# same way via -p:IlcInstructionSet=, just without a CI job. See the README section
+# "SIMD 指令集档位".
+#
+# The optional MiniOcrSingleFile=true jobs are tier-less: they skip AOT, so the JIT
+# probes the CPU at run time and lights up AVX2 / AVX-512 automatically. They are a
+# one-binary convenience package (measured slower than AOT) that self-extracts
+# libSkiaSharp / pdfium on first run.
 name: Publish Native AOT
 
 on:
@@ -21,40 +36,62 @@ concurrency:
 
 jobs:
   publish:
-    name: ${{ matrix.rid }}${{ matrix.singlefile && '-singlefile' || '' }}
+    name: ${{ matrix.rid }}${{ matrix.suffix }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # x64 + AVX2 (SimdPaddleOCR) — competition default
-          - rid: win-x64
-            os: windows-latest
-            avx2: true
-            singlefile: false
-          - rid: linux-x64
-            os: ubuntu-latest
-            avx2: true
-            singlefile: false
-          # ARM64: no AVX2 (NEON baseline)
+          # --- ARM64: NEON baseline, no x64 instruction sets ---
           - rid: osx-arm64
             os: macos-latest
-            avx2: false
+            simd: ""
+            suffix: ""
             singlefile: false
           # Native linux-arm64 runner (no qemu). If the runner label is
           # unavailable for the repo, remove this matrix entry.
           - rid: linux-arm64
             os: ubuntu-24.04-arm
-            avx2: false
+            simd: ""
+            suffix: ""
             singlefile: false
-          # True single-file (non-AOT): one binary, natives extract on first run
+
+          # --- x64 SIMD tiers (two only) ---
+          # avx2 = Haswell (2013)+; portable default, keeps the unsuffixed artifact name.
           - rid: win-x64
             os: windows-latest
-            avx2: false
+            simd: avx2
+            suffix: ""
+            singlefile: false
+          - rid: linux-x64
+            os: ubuntu-latest
+            simd: avx2
+            suffix: ""
+            singlefile: false
+          # Highest practical tier: Ice Lake / Tiger Lake / Zen 4-5 / Sapphire Rapids
+          # class. avx512v3 measures the same as avx512v2 on the reference page but
+          # requires newer silicon, so v2 is the ceiling here.
+          - rid: win-x64
+            os: windows-latest
+            simd: avx512v2
+            suffix: -avx512v2
+            singlefile: false
+          - rid: linux-x64
+            os: ubuntu-latest
+            simd: avx512v2
+            suffix: -avx512v2
+            singlefile: false
+
+          # --- true single-file (non-AOT): one binary, natives extract on first run ---
+          - rid: win-x64
+            os: windows-latest
+            simd: ""
+            suffix: -singlefile
             singlefile: true
           - rid: linux-x64
             os: ubuntu-latest
-            avx2: false
+            simd: ""
+            suffix: -singlefile
             singlefile: true
 
     steps:
@@ -68,15 +105,11 @@ jobs:
           dotnet-version: "11.0.x"
           dotnet-quality: preview
 
-      - name: Publish (${{ matrix.rid }}${{ matrix.singlefile && ' single-file' || ' AOT' }})
+      - name: Publish (${{ matrix.rid }}${{ matrix.suffix }})
         shell: bash
         run: |
           set -euo pipefail
-          SUFFIX=""
-          if [ "${{ matrix.singlefile }}" = "true" ]; then
-            SUFFIX="-singlefile"
-          fi
-          OUT="artifacts/${{ matrix.rid }}${SUFFIX}"
+          OUT="artifacts/${{ matrix.rid }}${{ matrix.suffix }}"
           mkdir -p "$OUT"
           # Use -p: (not /p:) — Git Bash on Windows strips the leading slash and
           # MSBuild then treats "p:IlcInstructionSet=avx2" as a second project
@@ -88,13 +121,13 @@ jobs:
               --self-contained true \
               -o "$OUT" \
               -p:MiniOcrSingleFile=true
-          elif [ "${{ matrix.avx2 }}" = "true" ]; then
+          elif [ -n "${{ matrix.simd }}" ]; then
             dotnet publish ./MiniOcr.csproj \
               -c Release \
               -r "${{ matrix.rid }}" \
               --self-contained true \
               -o "$OUT" \
-              -p:IlcInstructionSet=avx2
+              -p:IlcInstructionSet=${{ matrix.simd }}
           else
             dotnet publish ./MiniOcr.csproj \
               -c Release \
@@ -107,11 +140,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          SUFFIX=""
-          if [ "${{ matrix.singlefile }}" = "true" ]; then
-            SUFFIX="-singlefile"
-          fi
-          RID="${{ matrix.rid }}${SUFFIX}"
+          RID="${{ matrix.rid }}${{ matrix.suffix }}"
           SRC="artifacts/${RID}"
           # Drop large debug symbol files if present (StripSymbols=true already)
           find "$SRC" -type f \( -name '*.dbg' -o -name '*.pdb' \) -delete || true
@@ -133,8 +162,8 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: miniocr-${{ matrix.rid }}${{ matrix.singlefile && '-singlefile' || '' }}
-          path: dist/miniocr-${{ matrix.rid }}${{ matrix.singlefile && '-singlefile' || '' }}.zip
+          name: miniocr-${{ matrix.rid }}${{ matrix.suffix }}
+          path: dist/miniocr-${{ matrix.rid }}${{ matrix.suffix }}.zip
           if-no-files-found: error
           retention-days: 30
 
@@ -142,7 +171,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/miniocr-${{ matrix.rid }}${{ matrix.singlefile && '-singlefile' || '' }}.zip
+          files: dist/miniocr-${{ matrix.rid }}${{ matrix.suffix }}.zip
           tag_name: ${{ github.event.release.tag_name || github.ref_name }}
           fail_on_unmatched_files: true
         env:
