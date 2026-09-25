@@ -17,8 +17,10 @@ public sealed class LlmFileConfig
     public string ApiKey { get; set; } = "";
     public string Model { get; set; } = "gpt-4o-mini";
     public int TimeoutSeconds { get; set; } = 120;
-    /// <summary>Max OCR text chars per LLM NER batch (clamped 1000–2_000_000). Default 300000 for long-context models.</summary>
+    /// <summary>Safety cap on OCR text chars per LLM NER request (clamped 1000–2_000_000). A pages-per-request group that would exceed this is split. Default 300000.</summary>
     public int MaxCharsPerRequest { get; set; } = 300000;
+    /// <summary>Non-empty OCR pages per LLM NER request (clamped 1–2000). Default 10. Blank pages are skipped and do not count.</summary>
+    public int PagesPerRequest { get; set; } = 10;
     /// <summary>Max parallel LLM NER batch completions (clamped 1–32). Default 8.</summary>
     public int MaxConcurrency { get; set; } = 8;
     /// <summary>Max parallel vision OCR page calls when ocr.mode=llm (clamped 1–256).</summary>
@@ -61,6 +63,8 @@ public sealed class LlmRuntimeConfig
     public string Model { get; init; } = "gpt-4o-mini";
     public int TimeoutSeconds { get; init; } = 120;
     public int MaxCharsPerRequest { get; init; } = 300000;
+    /// <summary>Non-empty pages sent to one NER request. Default 10.</summary>
+    public int PagesPerRequest { get; init; } = 10;
     public int MaxConcurrency { get; init; } = 8;
     public int OcrConcurrency { get; init; } = 32;
     public int OcrMaxCharsHint { get; init; } = 8000;

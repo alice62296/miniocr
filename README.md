@@ -1,6 +1,6 @@
 # MiniOCR
 
-基于 [Sdcb.SimdPaddleOCR](https://github.com/sdcb/SimdPaddleOCR) 的 **Native AOT** PDF OCR HTTP API（**.NET 11 RC / `net11.0`**）。
+基于 [huiyuanai709/SimdPaddleOCR](https://github.com/huiyuanai709/SimdPaddleOCR)（上游 [sdcb/SimdPaddleOCR](https://github.com/sdcb/SimdPaddleOCR)，子模块钉在 `e19414c`）的 **Native AOT** PDF OCR HTTP API（**.NET 11 RC / `net11.0`**）。
 
 从 URL 并发下载 PDF（≤300 MB），按页流式栅格化 + OCR（最多约 2000 页），返回每页文本、耗时，以及 **公司名 / 人名** JSON。
 
@@ -142,8 +142,9 @@ dotnet --list-sdks
 ## AOT 发布（关键，竞赛默认）
 
 ```bash
-git clone https://github.com/huiyuanai709/miniocr.git
+git clone --recurse-submodules https://github.com/huiyuanai709/miniocr.git
 cd miniocr
+# 已有工作区缺子模块时：git submodule update --init --recursive
 dotnet publish -c Release -r linux-x64 -o ./artifacts/linux-x64
 # 换档位（默认 avx2）：加 -p:IlcInstructionSet=avx512 / avx512v2 / avxvnni …
 ```
@@ -234,6 +235,7 @@ cd artifacts/linux-x64-singlefile
     "model": "gpt-4o-mini",
     "timeoutSeconds": 120,
     "maxCharsPerRequest": 300000,
+    "pagesPerRequest": 10,
     "maxConcurrency": 8,
     "ocrConcurrency": 32,
     "ocrMaxCharsHint": 8000,
@@ -257,7 +259,7 @@ cd artifacts/linux-x64-singlefile
 **优先级：**
 
 - OCR：环境变量 `MINIOCR_*` **覆盖** 文件；文件中 `null` / 未写且 `autoScaleFromCpu: true` 时按 CPU 核数自动推算。`MINIOCR_OCR_MODE` 覆盖 `ocr.mode`。
-- LLM：主要读配置文件；可用 `MINIOCR_LLM_API_KEY` / `MINIOCR_LLM_BASE_URL` / `MINIOCR_LLM_MODEL` / `MINIOCR_LLM_MAX_CONCURRENCY` / `MINIOCR_LLM_OCR_CONCURRENCY` / `MINIOCR_LLM_OCR_JPEG_QUALITY` / `MINIOCR_LLM_THINKING` 覆盖。也可用 `MINIOCR_CONFIG_PATH` 指定配置文件。**不会**把 `apiKey` 打进日志（仅显示 `(set)` / `(empty)`）。
+- LLM：主要读配置文件；可用 `MINIOCR_LLM_API_KEY` / `MINIOCR_LLM_BASE_URL` / `MINIOCR_LLM_MODEL` / `MINIOCR_LLM_MAX_CONCURRENCY` / `MINIOCR_LLM_PAGES_PER_REQUEST` / `MINIOCR_LLM_OCR_CONCURRENCY` / `MINIOCR_LLM_OCR_JPEG_QUALITY` / `MINIOCR_LLM_THINKING` 覆盖。也可用 `MINIOCR_CONFIG_PATH` 指定配置文件。**不会**把 `apiKey` 打进日志（仅显示 `(set)` / `(empty)`）。
 
 #### OCR 模式：`local` vs `llm`（视觉 OCR）
 
@@ -307,21 +309,23 @@ cd artifacts/linux-x64-singlefile
    - 本地（如 Ollama 兼容层）：`http://127.0.0.1:11434` + 你的视觉模型名
 4. 或仅用环境变量：`export MINIOCR_LLM_API_KEY=sk-...`（其余仍可读文件）。
 5. **文本 NER 并发**：`llm.maxConcurrency`（默认 **8**，范围 1–32）用于 `local` 模式下的 Chat Completions 批次；`MINIOCR_LLM_MAX_CONCURRENCY` 可覆盖。
-6. **视觉 OCR 并发**：`llm.ocrConcurrency`（默认 **32**，1–256）；`MINIOCR_LLM_OCR_CONCURRENCY` 可覆盖。调高可缩短墙钟时间，但请留意 **费率与限流**。
-7. **视觉 JPEG 质量**：`llm.ocrJpegQuality`（默认 **70**，40–95）；`MINIOCR_LLM_OCR_JPEG_QUALITY` 可覆盖。
-8. **`maxCharsPerRequest`（长上下文）**：默认 **300000**（钳制 1000–2_000_000）。DeepSeek Flash 等约 **1M context** 时可设 `200000`–`800000`，减少批次数、一次塞入更多页；注意提供商 **token** 上限（约 1 个中文字 ≈ 1–2 tokens），勿盲目顶满字符上限。
-9. **`thinking`（DeepSeek 思考模式）**：DeepSeek Flash / v4 等模型 **默认开启思考**，会拖慢 NER/OCR。本项目默认 **`thinking: false`（关闭）**，请求体会显式发送：
+6. **文本 NER 分页**：`llm.pagesPerRequest`（默认 **10**，范围 1–2000）表示每个请求包含的**非空** OCR 页数；`MINIOCR_LLM_PAGES_PER_REQUEST` 可覆盖。空白页不占名额、不发请求。
+7. **视觉 OCR 并发**：`llm.ocrConcurrency`（默认 **32**，1–256）；`MINIOCR_LLM_OCR_CONCURRENCY` 可覆盖。调高可缩短墙钟时间，但请留意 **费率与限流**。
+8. **视觉 JPEG 质量**：`llm.ocrJpegQuality`（默认 **70**，40–95）；`MINIOCR_LLM_OCR_JPEG_QUALITY` 可覆盖。
+9. **`maxCharsPerRequest`（安全上限）**：默认 **300000**（钳制 1000–2_000_000）。分组以 `pagesPerRequest` 为准；若下一页会让当前组超过该字符数，则提前拆组。单页超限时截断后单独发送。
+10. **`thinking`（DeepSeek 思考模式）**：DeepSeek Flash / v4 等模型 **默认开启思考**，会拖慢 NER/OCR。本项目默认 **`thinking: false`（关闭）**，请求体会显式发送：
    ```json
    "thinking": { "type": "disabled" }
    ```
    需要开启时设 `"thinking": true` 或 `"enabled"`（亦可 `MINIOCR_LLM_THINKING=1|true|enabled`），将发送 `{ "type": "enabled" }`。配置接受布尔或字符串：`false` / `"disabled"` → disabled；`true` / `"enabled"` → enabled。文本 NER 与视觉 OCR 均会带上该字段。
-10. `local` 模式下 LLM **未启用 / 无 key** 时：仅当 `fallbackToHeuristics: true` 才用启发式 NER（默认 **false** → `entities` 为空）。**一旦调用了 LLM NER**（成功为空或失败），**绝不**再静默回退启发式——记错误日志并返回空实体。`ocr.mode=llm` 视觉路径同样只用结构化视觉输出，不用启发式 invent 实体。
+11. `local` 模式下 LLM **未启用 / 无 key** 时：仅当 `fallbackToHeuristics: true` 才用启发式 NER（默认 **false** → `entities` 为空）。**一旦调用了 LLM NER**（成功为空或失败），**绝不**再静默回退启发式——记错误日志并返回空实体。`ocr.mode=llm` 视觉路径同样只用结构化视觉输出，不用启发式 invent 实体。
 
 ### 吞吐旋钮（文件 + 环境变量 / 请求）
 
 | 变量 | 文件字段 | 默认（auto-scale，约 8 核） | 说明 |
 | --- | --- | ---: | --- |
 | `MINIOCR_OCR_MODE` | `ocr.mode` | **local** | `local`（Paddle）或 `llm`（视觉；跳过本地模型） |
+| `MINIOCR_LLM_PAGES_PER_REQUEST` | `llm.pagesPerRequest` | **10**（1–2000） | `local` 文本 NER：每个请求的非空页数 |
 | `MINIOCR_LLM_OCR_CONCURRENCY` | `llm.ocrConcurrency` | **32**（1–256） | `ocr.mode=llm` 时页级视觉并发 |
 | `MINIOCR_LLM_OCR_JPEG_QUALITY` | `llm.ocrJpegQuality` | **70**（40–95） | `ocr.mode=llm` 时页图 JPEG 质量（更低=更快编码/更小上传） |
 | `MINIOCR_LLM_THINKING` | `llm.thinking` | **false**（disabled） | DeepSeek 思考模式；`0/1/false/true/disabled/enabled`；默认关闭并显式发送 `thinking.type=disabled` |
@@ -421,12 +425,12 @@ curl -sS http://127.0.0.1:5080/health
 
 ### 实体抽取（LLM 优先；无 LLM 后启发式可选）
 
-全部页 OCR 完成后抽取 `entities`：
+`local` 模式在 OCR 进行中就开始抽取，不必等全书结束：
 
-1. **LLM（推荐，`local` 模式文本 NER）**：若 `llm.enabled` 且配置了 `apiKey`，将页文本按 `maxCharsPerRequest`（默认 **300000** 字，钳制至 **2_000_000**）分批，并以 `maxConcurrency`（默认 **8**）为上限**并行**调用 OpenAI 兼容 `POST {baseUrl}/v1/chat/completions`，提示词要求只返回严格 JSON `{"companies":["..."],"persons":["..."]}`（中英均可；禁止臆造正文没有的名字）。各批结果线程安全合并去重，再回扫各页文本填充 `pages` / `count`。
+1. **LLM（推荐，`local` 模式文本 NER）**：若 `llm.enabled` 且配置了 `apiKey`，按 **非空页** 分组。默认每 **10** 个有文字的页组成一个请求（`llm.pagesPerRequest`，范围 1–2000），空白页（OCR 文本为空或只有空白）**不发给 LLM**，也**不出现在协议输出的 `pages` 里**。分组按文档顺序累计非空页，而不是固定的「第 1–10 页 / 11–20 页」窗口——这样空白页不会占掉名额，也不会产生整组为空的请求。页码仍写在提示词的 `--- page N ---` 里，N 是 PDF 原页码。某一组若再加一页就会超过 `maxCharsPerRequest`（默认 **300000**），则提前拆开；单页超限则截断后单独发送。请求在凑满一组时就发出（与后续 OCR 重叠），在途请求数不超过 `maxConcurrency`（默认 **8**）。提示词要求只返回严格 JSON `{"companies":["..."],"persons":["..."]}`（中英均可；禁止臆造正文没有的名字）。各批结果线程安全合并去重，再回扫各非空页文本填充 `count` / `originText`。
 2. **LLM 已调用后**：失败或结果为空时 **不**再回退 `EntityExtractor` 启发式——记错误日志并返回空 `entities`（避免静默启发式人名/公司名污染竞赛结果）。
-3. **仅当 LLM 未启用 / 无 key**：若显式 `fallbackToHeuristics: true`，才使用 `EntityExtractor`（Regex + 百家姓 HashSet，`[GeneratedRegex]`，无 ML 包，AOT 安全）；默认 **false** → 空实体。
-4. **`ocr.mode=llm`（视觉）**：实体来自页级结构化 `ruleList`（及兼容的 companies/persons 字段），**不用**启发式 invent。
+3. **仅当 LLM 未启用 / 无 key**：若显式 `fallbackToHeuristics: true`，才使用 `EntityExtractor`（Regex + 百家姓 HashSet，`[GeneratedRegex]`，无 ML 包，AOT 安全）；默认 **false** → 空实体。空白页同样不进入协议输出。
+4. **`ocr.mode=llm`（视觉）**：实体来自页级结构化 `ruleList`（及兼容的 companies/persons 字段），**不用**启发式 invent。视觉调用仍是一页一次（送出前无法知道该页有没有字）。返回文本为空且没有 `ruleList` 的页会从输出中去掉。
 
 | 类型 | 启发式规则（摘要；仅 `fallbackToHeuristics: true` 且未走 LLM 时） |
 | --- | --- |
@@ -435,7 +439,7 @@ curl -sS http://127.0.0.1:5080/health
 
 冒烟：`dotnet run -c Release --project tests/MiniOcr.EntitySmoke`（启发式单元）。无 API key 时服务仍可启动；默认不会静默填启发式实体。
 
-**长上下文提示：** DeepSeek Flash 等约 1M context 时，可将 `maxCharsPerRequest` 设为 `200000`–`800000`，一次请求塞入更多页、减少批次；仍需对照提供商 **token** 限额（中文约 1 字 ≈ 1–2 tokens）。
+**长上下文提示：** 分组大小首先看 `pagesPerRequest`。`maxCharsPerRequest` 只是安全阀；DeepSeek Flash 等约 1M context 时一般不用把默认 300000 再拉高。仍需对照提供商 **token** 限额（中文约 1 字 ≈ 1–2 tokens）。
 
 **局限：** 启发式会漏/误；LLM 依赖模型与 OCR 文本质量，竞赛场景请复核关键实体。
 
@@ -524,7 +528,7 @@ The current CPU is missing one or more of the required instruction sets.
 | 下载 | `HttpClient`：若 `Accept-Ranges: bytes` 且已知 `Content-Length`，则并行 Range 写入预分配缓冲；否则单流写入预分配/可控增长缓冲。硬顶 **300 MB**。缓冲来自 `ArrayPool<byte>`。 |
 | 栅格化 | PDFtoImage（PDFium + SkiaSharp）；**local** 默认 **96 DPI**，**llm** 未显式配置时默认 **72 DPI**；每 worker **一次** `PdfDocument.Load` + `ToImages`；`AntiAliasing=None` + `Grayscale`；多生产者写入有界 Channel，**绝不**同时持有全部页位图。llm 默认更多 raster workers（`min(8,cores)`）。 |
 | OCR | **local**：复用多个 `PaddleOcrAll`（ChineseV6Tiny，默认可关 CLS）；页级引擎池互斥租用；Channel 上 raster↔OCR 重叠。**llm**：不加载 Paddle；**每页** JPEG（质量默认 70）经有界队列立刻交给视觉 worker（`ocrConcurrency`），与栅格重叠——不再等全本编码完才发第一张；优先直接产出 B04/B06 `ruleList`。 |
-| 实体 | 优先 `LlmEntityExtractor`（Chat Completions 分批）；失败/关闭则 `EntityExtractor` 启发式。 |
+| 实体 | 优先 `LlmEntityExtractor`：每 10 个非空页一组 JSON NER，OCR 未结束即可发出，`maxConcurrency` 并行；空白页不发送、不出现在输出。失败/关闭则 `EntityExtractor` 启发式。 |
 | JSON | 源生成 `AppJsonContext`，AOT 友好。 |
 
 ### 峰值内存（量级，非承诺值）
@@ -538,8 +542,8 @@ The current CPU is missing one or more of the required instruction sets.
 
 | 包 | 说明 |
 | --- | --- |
-| `Sdcb.SimdPaddleOCR` 1.4.1 | 纯托管 PP-OCRv6 |
-| `Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny` | 中文 tiny DET+REC（CLS 可选） |
+| `external/SimdPaddleOCR` @ `e19414c` | [fork](https://github.com/huiyuanai709/SimdPaddleOCR) 的 `ProjectReference`（分支 `cursor/net11-ocr-perf-4add`），不再使用 NuGet `Sdcb.SimdPaddleOCR` 1.4.2。Apache-2.0 |
+| 同子模块内 `ChineseV6Tiny` | 中文 tiny DET+REC（CLS 可选），与引擎同一棵源码树，避免和 NuGet 模型包的类型不一致 |
 | `PDFtoImage` 5.4.0 | PDFium 栅格化（SkiaSharp） |
 
 ## API
@@ -557,6 +561,8 @@ The current CPU is missing one or more of the required instruction sets.
 ```
 miniocr/
   MiniOcr.csproj          # Web + PublishAot + IlcInstructionSet=avx2（仅 x64）；可选 MiniOcrSingleFile
+  .gitmodules             # external/SimdPaddleOCR @ e19414c
+  external/SimdPaddleOCR/ # fork 源码（ProjectReference；CI checkout 带 submodules）
   .github/workflows/publish.yml  # 多平台 AOT + linux/win 单文件矩阵
   Program.cs              # SlimBuilder + /challenge /ocr /health
   AppJsonContext.cs       # AOT JSON

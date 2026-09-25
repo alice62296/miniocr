@@ -19,7 +19,9 @@
     <OptimizationPreference>Speed</OptimizationPreference>
     <InvariantGlobalization>false</InvariantGlobalization>
     <StripSymbols>true</StripSymbols>
-    <DefaultItemExcludes>$(DefaultItemExcludes);tests/**;artifacts/**;dist/**;.github/**</DefaultItemExcludes>
+    <!-- external/ is the SimdPaddleOCR submodule. The Web SDK would otherwise
+         compile and publish every file under it alongside this project. -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);tests/**;artifacts/**;dist/**;.github/**;external/**</DefaultItemExcludes>
     <StaticWebAssetsEnabled>false</StaticWebAssetsEnabled>
   </PropertyGroup>
 
@@ -37,9 +39,17 @@
 
   <ItemGroup>
     <PackageReference Include="PDFtoImage" Version="5.4.0" />
-    <PackageReference Include="Sdcb.SimdPaddleOCR" Version="1.4.2" />
-    <PackageReference Include="Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny" Version="1.0.0" />
+    <!-- Pinned fork commit e19414c (branch cursor/net11-ocr-perf-4add), not NuGet 1.4.2.
+         ChineseV6Tiny models come from the same tree so the bundle types match. -->
+    <ProjectReference Include="external/SimdPaddleOCR/src/Sdcb.SimdPaddleOCR/Sdcb.SimdPaddleOCR.csproj" />
+    <ProjectReference Include="external/SimdPaddleOCR/src/models/Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny/Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny.csproj" />
   </ItemGroup>
+
+  <Target Name="EnsureSimdPaddleOcrSubmodule" BeforeTargets="Restore;Build;Publish">
+    <Error
+      Condition="!Exists('$(MSBuildThisFileDirectory)external/SimdPaddleOCR/src/Sdcb.SimdPaddleOCR/Sdcb.SimdPaddleOCR.csproj')"
+      Text="Missing external/SimdPaddleOCR. From the repo root run: git submodule update --init --recursive" />
+  </Target>
 
   <ItemGroup>
     <!-- Keep model / Skia / PDFium assemblies from being trimmed away -->

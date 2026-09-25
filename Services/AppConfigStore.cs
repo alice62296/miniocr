@@ -153,6 +153,14 @@ public static class AppConfigStore
             Environment.GetEnvironmentVariable("MINIOCR_LLM_MODEL"),
             llm.Model) ?? "gpt-4o-mini";
 
+        int pagesPerRequest = llm.PagesPerRequest <= 0 ? 10 : llm.PagesPerRequest;
+        string? envPages = Environment.GetEnvironmentVariable("MINIOCR_LLM_PAGES_PER_REQUEST");
+        if (!string.IsNullOrWhiteSpace(envPages) &&
+            int.TryParse(envPages.Trim(), out int parsedPages))
+        {
+            pagesPerRequest = parsedPages;
+        }
+
         int maxConcurrency = llm.MaxConcurrency <= 0 ? 8 : llm.MaxConcurrency;
         string? envConcurrency = Environment.GetEnvironmentVariable("MINIOCR_LLM_MAX_CONCURRENCY");
         if (!string.IsNullOrWhiteSpace(envConcurrency) &&
@@ -193,6 +201,7 @@ public static class AppConfigStore
             TimeoutSeconds = Math.Clamp(llm.TimeoutSeconds <= 0 ? 120 : llm.TimeoutSeconds, 5, 600),
             MaxCharsPerRequest = Math.Clamp(
                 llm.MaxCharsPerRequest <= 0 ? 300_000 : llm.MaxCharsPerRequest, 1000, 2_000_000),
+            PagesPerRequest = Math.Clamp(pagesPerRequest, 1, 2000),
             MaxConcurrency = Math.Clamp(maxConcurrency, 1, 32),
             OcrConcurrency = Math.Clamp(ocrConcurrency, 1, 256),
             OcrMaxCharsHint = Math.Clamp(ocrMaxChars, 500, 100_000),
@@ -377,6 +386,7 @@ public static class AppConfigStore
             "model": "gpt-4o-mini",
             "timeoutSeconds": 120,
             "maxCharsPerRequest": 300000,
+            "pagesPerRequest": 10,
             "maxConcurrency": 8,
             "ocrConcurrency": 32,
             "ocrMaxCharsHint": 8000,

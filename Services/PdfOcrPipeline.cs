@@ -248,6 +248,7 @@ public sealed class PdfOcrPipeline
 
         // Entities derived from vision ruleList (for any consumer of OcrResponse.Entities).
         OcrEntities entities = EntitiesFromVisionPages(pages);
+        List<OcrPageResult> visible = VisiblePages(pages);
 
         totalSw.Stop();
 
@@ -272,7 +273,7 @@ public sealed class PdfOcrPipeline
                 OcrMs = Math.Round(ocrTotal, 1),
                 TotalMs = Math.Round(totalSw.Elapsed.TotalMilliseconds, 1),
             },
-            Pages = pages.ToList(),
+            Pages = visible,
             Entities = entities,
         };
     }
@@ -302,6 +303,11 @@ public sealed class PdfOcrPipeline
         double rasterTotal = 0;
         double ocrTotal = 0;
         object timingLock = new();
+
+        using CancellationTokenSource llmCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        LlmEntityExtractor.LlmExtractionSession? ner = _llm is { IsUsable: true }
+            ? _llm.Begin(pageCount, llmCts.Token)
+            : null;
 
         Task producer = ProduceParallelAsync(
             pdfBytes, pdfByteCount, pageCount, renderOptions, rasterized.Writer, ct);
@@ -349,6 +355,10 @@ public sealed class PdfOcrPipeline
                             rasterTotal += rasterMs;
                             ocrTotal += ocrSw.Elapsed.TotalMilliseconds;
                         }
+
+                        // Queue a 10-page NER group as soon as those pages exist,
+                        // while later pages are still in OCR.
+                        ner?.Add(pages[index]);
                     }
                     finally
                     {
@@ -363,10 +373,47 @@ public sealed class PdfOcrPipeline
             .Select(_ => ConsumerAsync())
             .ToArray();
 
-        await producer.ConfigureAwait(false);
-        await Task.WhenAll(consumers).ConfigureAwait(false);
+        Exception? failure = null;
+        try
+        {
+            await producer.ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            failure = ex;
+            llmCts.Cancel();
+        }
 
-        OcrEntities entities = await ExtractEntitiesAsync(pages, ct).ConfigureAwait(false);
+        try
+        {
+            await Task.WhenAll(consumers).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            failure ??= ex;
+            llmCts.Cancel();
+        }
+
+        if (failure is not null)
+        {
+            if (ner is not null)
+                await ner.AbandonAsync().ConfigureAwait(false);
+            throw failure;
+        }
+
+        for (int i = 0; i < pageCount; i++)
+        {
+            if (pages[i] is null)
+            {
+                llmCts.Cancel();
+                if (ner is not null)
+                    await ner.AbandonAsync().ConfigureAwait(false);
+                throw new InvalidOperationException($"Missing OCR result for page {i + 1}.");
+            }
+        }
+
+        OcrEntities entities = await ExtractEntitiesAsync(pages, ner).ConfigureAwait(false);
+        List<OcrPageResult> visible = VisiblePages(pages);
 
         totalSw.Stop();
 
@@ -384,9 +431,21 @@ public sealed class PdfOcrPipeline
                 OcrMs = Math.Round(ocrTotal, 1),
                 TotalMs = Math.Round(totalSw.Elapsed.TotalMilliseconds, 1),
             },
-            Pages = pages.ToList(),
+            Pages = visible,
             Entities = entities,
         };
+    }
+
+    private static List<OcrPageResult> VisiblePages(OcrPageResult[] pages)
+    {
+        List<OcrPageResult> visible = new(pages.Length);
+        foreach (OcrPageResult page in pages)
+        {
+            if (page is not null && ChallengeResultMapper.IncludeInOutput(page))
+                visible.Add(page);
+        }
+
+        return visible;
     }
 
     private static RenderOptions CreateRenderOptions(int dpi) =>
@@ -428,18 +487,19 @@ public sealed class PdfOcrPipeline
         return EntityExtractor.ToEntities(acc);
     }
 
-    private async Task<OcrEntities> ExtractEntitiesAsync(OcrPageResult[] pages, CancellationToken ct)
+    private async Task<OcrEntities> ExtractEntitiesAsync(
+        OcrPageResult[] pages,
+        LlmEntityExtractor.LlmExtractionSession? ner)
     {
-        bool preferLlm = _llm is { IsUsable: true };
         // Heuristics only when LLM was never attempted (disabled / no key).
         // After an LLM NER attempt, never fall back — log and return empty.
         bool fallbackWhenNoLlm = _llm?.Config.FallbackToHeuristics ?? false;
 
-        if (preferLlm)
+        if (ner is not null)
         {
             try
             {
-                OcrEntities llmEntities = await _llm!.ExtractAsync(pages, ct).ConfigureAwait(false);
+                OcrEntities llmEntities = await ner.CompleteAsync().ConfigureAwait(false);
                 _logger.LogInformation(
                     "LLM NER done: companies={Companies}, persons={Persons}",
                     llmEntities.Companies.Count,

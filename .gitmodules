@@ -1,0 +1,3 @@
+[submodule "external/SimdPaddleOCR"]
+	path = external/SimdPaddleOCR
+	url = https://github.com/huiyuanai709/SimdPaddleOCR.git

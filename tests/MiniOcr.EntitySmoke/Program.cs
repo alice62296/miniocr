@@ -127,6 +127,108 @@ List<string> dupOrigins = ChallengeResultMapper.BuildOriginTexts(dup, "张伟");
 AssertTrue(dupOrigins.Count == 2, $"dup origins count={dupOrigins.Count}");
 
 Console.WriteLine();
+Console.WriteLine("=== blank pages omitted from protocol output ===");
+
+ChallengeFileResult skipped = ChallengeResultMapper.BuildFileResult(
+    "f2",
+    [
+        new OcrPageResult { Page = 1, Text = otPage },
+        new OcrPageResult { Page = 2, Text = "   \n\t" },
+        new OcrPageResult { Page = 4, Text = "联系人：张伟出席会议。" },
+    ],
+    ["成都交子商圈物业服务有限公司"],
+    ["游春燕", "张伟"]);
+AssertTrue(skipped.Pages.Count == 2, "blank page omitted");
+AssertTrue(skipped.Pages[0].Page == 1 && skipped.Pages[1].Page == 4, "original page numbers kept");
+AssertTrue(
+    skipped.Pages[1].RuleList.Any(r => r.RuleCode == "B04" && r.RuleItemList.Any(i => i.PersonName == "张伟")),
+    "person on page 4 kept");
+
+OcrResponse vision = new()
+{
+    Pages =
+    [
+        new OcrPageResult { Page = 1, Text = "" },
+        new OcrPageResult
+        {
+            Page = 3,
+            Text = "  ",
+            RuleList =
+            [
+                new ChallengeRule
+                {
+                    RuleCode = "B04",
+                    RuleName = "人员名称",
+                    RuleItemList =
+                    [
+                        new ChallengeRuleItem
+                        {
+                            PersonName = "张伟",
+                            Count = 1,
+                            OriginText = ["出席人员包括张伟与同事若干人"],
+                        },
+                    ],
+                },
+            ],
+        },
+    ],
+};
+ChallengeFileResult visionMapped = ChallengeResultMapper.BuildFileResult("v", vision);
+AssertTrue(visionMapped.Pages.Count == 1 && visionMapped.Pages[0].Page == 3, "vision rules kept when text blank; empty page dropped");
+
+Console.WriteLine();
+Console.WriteLine("=== LLM page groups ===");
+
+List<OcrPageResult> twentyFive = [];
+for (int i = 1; i <= 25; i++)
+    twentyFive.Add(new OcrPageResult { Page = i, Text = "正文" + i });
+List<LlmPageGrouper.PageBatch> groups = LlmPageGrouper.BuildGroups(twentyFive, pagesPerRequest: 10, maxChars: 300_000);
+AssertTrue(groups.Count == 3, $"25 pages → 3 groups, got {groups.Count}");
+AssertTrue(groups[0].PageNumbers.Length == 10 && groups[0].PageNumbers[0] == 1 && groups[0].PageNumbers[9] == 10, "group1 pages 1-10");
+AssertTrue(groups[1].PageNumbers[0] == 11 && groups[1].PageNumbers[9] == 20, "group2 pages 11-20");
+AssertTrue(groups[2].PageNumbers.Length == 5 && groups[2].PageNumbers[0] == 21 && groups[2].PageNumbers[4] == 25, "group3 pages 21-25");
+
+List<OcrPageResult> withBlanks = [];
+for (int i = 1; i <= 15; i++)
+    withBlanks.Add(new OcrPageResult { Page = i, Text = i % 3 == 0 ? "  " : "字" + i });
+List<LlmPageGrouper.PageBatch> nonEmptyGroups = LlmPageGrouper.BuildGroups(withBlanks, pagesPerRequest: 10, maxChars: 300_000);
+int nonEmptyCount = withBlanks.Count(p => !LlmPageGrouper.IsBlank(p));
+AssertTrue(nonEmptyCount == 10, $"expected 10 non-empty, got {nonEmptyCount}");
+AssertTrue(nonEmptyGroups.Count == 1 && nonEmptyGroups[0].PageNumbers.Length == 10, "10 non-empty pages → one request");
+AssertTrue(!nonEmptyGroups[0].PageNumbers.Any(n => n % 3 == 0), "blank page numbers are not in the group");
+AssertTrue(nonEmptyGroups[0].PageNumbers[0] == 1 && nonEmptyGroups[0].PageNumbers[^1] == 14, "original numbers 1..14 skipping multiples of 3");
+
+List<LlmPageGrouper.PageBatch> allBlank = LlmPageGrouper.BuildGroups(
+    [new OcrPageResult { Page = 1, Text = "" }, new OcrPageResult { Page = 2, Text = " \n" }],
+    10,
+    300_000);
+AssertTrue(allBlank.Count == 0, "all-blank document makes no LLM group");
+
+OcrPageResult longPage = new() { Page = 7, Text = new string('甲', 80) };
+int oneLen = LlmPageGrouper.FormatPage(longPage).Length;
+OcrPageResult longPage2 = new() { Page = 8, Text = new string('乙', 80) };
+List<LlmPageGrouper.PageBatch> split = LlmPageGrouper.BuildGroups(
+    [longPage, longPage2],
+    pagesPerRequest: 10,
+    maxChars: oneLen);
+AssertTrue(split.Count == 2 && split[0].PageNumbers is [7] && split[1].PageNumbers is [8], "char cap splits before 10 pages");
+
+OcrPageResult huge = new() { Page = 2, Text = new string('丙', 200) };
+List<LlmPageGrouper.PageBatch> truncated = LlmPageGrouper.BuildGroups([huge], 10, 40);
+AssertTrue(truncated.Count == 1 && truncated[0].PageNumbers is [2] && truncated[0].Text.Length == 40, "oversized page truncated and sent alone");
+
+LlmPageGrouper.OrderedBuffer buffer = new(5, pagesPerRequest: 2, maxChars: 100_000);
+AssertTrue(buffer.Add(new OcrPageResult { Page = 2, Text = "乙" }).Count == 0, "out-of-order page 2 waits for page 1");
+List<LlmPageGrouper.PageBatch> firstReady = buffer.Add(new OcrPageResult { Page = 1, Text = "甲" });
+AssertTrue(firstReady.Count == 1 && firstReady[0].PageNumbers is [1, 2], "group emits once the prefix has 2 non-empty pages");
+AssertTrue(buffer.Add(new OcrPageResult { Page = 3, Text = "   " }).Count == 0, "blank page emits nothing");
+AssertTrue(buffer.Add(new OcrPageResult { Page = 5, Text = "戊" }).Count == 0, "page 5 waits for page 4");
+List<LlmPageGrouper.PageBatch> secondReady = buffer.Add(new OcrPageResult { Page = 4, Text = "丁" });
+AssertTrue(secondReady.Count == 1 && secondReady[0].PageNumbers is [4, 5], "next group keeps original page numbers");
+AssertTrue(buffer.FlushRemainder().Count == 0, "no trailing partial group");
+AssertTrue(buffer.NonEmptyPages.Select(p => p.Page).SequenceEqual([1, 2, 4, 5]), "non-empty pages recorded in order");
+
+Console.WriteLine();
 if (failed == 0)
 {
     Console.WriteLine("All smoke checks passed.");
