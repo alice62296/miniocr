@@ -11,6 +11,14 @@ public static class ChallengeResultMapper
     public const int OriginMinLen = 10;
     public const int OriginMaxLen = 100;
 
+    /// <summary>
+    /// Pages with no OCR text are omitted from the protocol output.
+    /// A vision page that returned rules but left <c>text</c> blank is kept,
+    /// because the names and origin snippets live on the rule list.
+    /// </summary>
+    public static bool IncludeInOutput(OcrPageResult page) =>
+        !string.IsNullOrWhiteSpace(page.Text) || page.RuleList is { Count: > 0 };
+
     public static ChallengeFileResult BuildFileResult(string fileId, OcrResponse ocr)
     {
         // Vision OCR may already attach contest-shaped ruleList per page.
@@ -19,6 +27,8 @@ public static class ChallengeResultMapper
             List<ChallengePageResult> pages = new(ocr.Pages.Count);
             foreach (OcrPageResult page in ocr.Pages)
             {
+                if (!IncludeInOutput(page))
+                    continue;
                 pages.Add(new ChallengePageResult
                 {
                     Page = page.Page,
@@ -46,6 +56,8 @@ public static class ChallengeResultMapper
         List<ChallengePageResult> pageResults = new(pages.Count);
         foreach (OcrPageResult page in pages)
         {
+            if (!IncludeInOutput(page))
+                continue;
             string text = page.Text ?? "";
             List<ChallengeRuleItem> personItems = BuildPersonItems(text, personNames);
             List<ChallengeRuleItem> companyItems = BuildCompanyItems(text, companyNames);
