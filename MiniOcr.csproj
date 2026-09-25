@@ -39,7 +39,7 @@
 
   <ItemGroup>
     <PackageReference Include="PDFtoImage" Version="5.4.0" />
-    <!-- Pinned fork commit e19414c (branch cursor/net11-ocr-perf-4add), not NuGet 1.4.2.
+    <!-- Pinned fork main @ 6aae0ad (PR #2 merged), not NuGet 1.4.2.
          ChineseV6Tiny models come from the same tree so the bundle types match. -->
     <ProjectReference Include="external/SimdPaddleOCR/src/Sdcb.SimdPaddleOCR/Sdcb.SimdPaddleOCR.csproj" />
     <ProjectReference Include="external/SimdPaddleOCR/src/models/Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny/Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny.csproj" />

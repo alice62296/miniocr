@@ -98,7 +98,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # Pins external/SimdPaddleOCR (fork @ e19414c) used via ProjectReference.
+          # Checks out external/SimdPaddleOCR at the gitlink (fork main, currently 6aae0ad).
           submodules: recursive
 
       - name: Setup .NET 11 RC

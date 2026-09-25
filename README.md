@@ -1,6 +1,6 @@
 # MiniOCR
 
-基于 [huiyuanai709/SimdPaddleOCR](https://github.com/huiyuanai709/SimdPaddleOCR)（上游 [sdcb/SimdPaddleOCR](https://github.com/sdcb/SimdPaddleOCR)，子模块钉在 `e19414c`）的 **Native AOT** PDF OCR HTTP API（**.NET 11 RC / `net11.0`**）。
+基于 [huiyuanai709/SimdPaddleOCR](https://github.com/huiyuanai709/SimdPaddleOCR)（上游 [sdcb/SimdPaddleOCR](https://github.com/sdcb/SimdPaddleOCR)，子模块跟踪 `main`，当前钉在 `6aae0ad`）的 **Native AOT** PDF OCR HTTP API（**.NET 11 RC / `net11.0`**）。
 
 从 URL 并发下载 PDF（≤300 MB），按页流式栅格化 + OCR（最多约 2000 页），返回每页文本、耗时，以及 **公司名 / 人名** JSON。
 
@@ -542,7 +542,7 @@ The current CPU is missing one or more of the required instruction sets.
 
 | 包 | 说明 |
 | --- | --- |
-| `external/SimdPaddleOCR` @ `e19414c` | [fork](https://github.com/huiyuanai709/SimdPaddleOCR) 的 `ProjectReference`（分支 `cursor/net11-ocr-perf-4add`），不再使用 NuGet `Sdcb.SimdPaddleOCR` 1.4.2。Apache-2.0 |
+| `external/SimdPaddleOCR` @ `6aae0ad` | [fork](https://github.com/huiyuanai709/SimdPaddleOCR) `main` 的 `ProjectReference`（`.gitmodules` 里 `branch = main`），不再使用 NuGet `Sdcb.SimdPaddleOCR` 1.4.2。Apache-2.0 |
 | 同子模块内 `ChineseV6Tiny` | 中文 tiny DET+REC（CLS 可选），与引擎同一棵源码树，避免和 NuGet 模型包的类型不一致 |
 | `PDFtoImage` 5.4.0 | PDFium 栅格化（SkiaSharp） |
 
@@ -561,7 +561,7 @@ The current CPU is missing one or more of the required instruction sets.
 ```
 miniocr/
   MiniOcr.csproj          # Web + PublishAot + IlcInstructionSet=avx2（仅 x64）；可选 MiniOcrSingleFile
-  .gitmodules             # external/SimdPaddleOCR @ e19414c
+  .gitmodules             # external/SimdPaddleOCR tracks fork main (pinned 6aae0ad)
   external/SimdPaddleOCR/ # fork 源码（ProjectReference；CI checkout 带 submodules）
   .github/workflows/publish.yml  # 多平台 AOT + linux/win 单文件矩阵
   Program.cs              # SlimBuilder + /challenge /ocr /health
