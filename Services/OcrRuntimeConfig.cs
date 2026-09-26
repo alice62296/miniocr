@@ -9,7 +9,7 @@ namespace MiniOcr.Services;
 /// </summary>
 public sealed class OcrRuntimeConfig
 {
-    /// <summary><c>local</c> (Paddle) or <c>llm</c> (vision). Default local.</summary>
+    /// <summary><c>local</c> (Paddle), <c>llm</c> (vision), or <c>wechat</c> (Windows x64 plugin). Default local.</summary>
     public string Mode { get; init; } = "local";
     public int EngineCount { get; init; }
     public int DefaultDpi { get; init; }
@@ -21,6 +21,17 @@ public sealed class OcrRuntimeConfig
     public int DetLimitSideLength { get; init; }
     public bool AutoScaleFromCpu { get; init; }
     public int ProcessorCount { get; init; }
+
+    /// <summary>Explicit WeChatOCR.exe or wxocr.dll. Empty = auto-detect.</summary>
+    public string? WeChatOcrPath { get; init; }
+    /// <summary>WeChat version directory that contains mmmojo_64.dll. Empty = auto-detect.</summary>
+    public string? WeChatDir { get; init; }
+    /// <summary>How many WeChatOCR processes to keep. Each one runs a single request at a time.</summary>
+    public int WeChatInstances { get; init; } = 1;
+    /// <summary>When the plugin is missing or this is not Windows x64, fall back to local Paddle.</summary>
+    public bool WeChatFallbackToLocal { get; init; } = true;
+    public int WeChatConnectTimeoutSeconds { get; init; } = 20;
+    public int WeChatRequestTimeoutSeconds { get; init; } = 60;
 
     /// <summary>Load using env only (legacy / tests).</summary>
     public static OcrRuntimeConfig FromEnvironment() =>
@@ -95,6 +106,35 @@ public sealed class OcrRuntimeConfig
         int recBatch = Math.Clamp(ReadInt("MINIOCR_REC_BATCH", 8), 1, 64);
         int detLimit = Math.Clamp(ReadInt("MINIOCR_DET_LIMIT_SIDE", 960), 64, 4096);
 
+        // One WeChatOCR process is single-threaded. Default is a few processes, not one per core:
+        // a 12-thread laptop gets 3. Cap the auto default at 3; explicit values may go up to 8.
+        int wechatAuto = Math.Clamp(Math.Max(1, cores / 4), 1, 3);
+        int wechatInstances = ResolveInt(
+            "MINIOCR_WECHAT_INSTANCES",
+            ocr.WeChatInstances,
+            wechatAuto,
+            autoScale,
+            fixedFallback: 1);
+        wechatInstances = Math.Clamp(wechatInstances, 1, 8);
+
+        int connectTimeout = ResolveInt(
+            "MINIOCR_WECHAT_CONNECT_TIMEOUT",
+            ocr.WeChatConnectTimeoutSeconds,
+            autoDefault: 20,
+            autoScale: true,
+            fixedFallback: 20);
+        int requestTimeout = ResolveInt(
+            "MINIOCR_WECHAT_REQUEST_TIMEOUT",
+            ocr.WeChatRequestTimeoutSeconds,
+            autoDefault: 60,
+            autoScale: true,
+            fixedFallback: 60);
+
+        bool wechatFallback = ocr.WeChatFallbackToLocal;
+        string? fallbackEnv = Environment.GetEnvironmentVariable("MINIOCR_WECHAT_FALLBACK");
+        if (!string.IsNullOrWhiteSpace(fallbackEnv))
+            wechatFallback = ReadBool("MINIOCR_WECHAT_FALLBACK", wechatFallback);
+
         return new OcrRuntimeConfig
         {
             Mode = mode,
@@ -108,6 +148,12 @@ public sealed class OcrRuntimeConfig
             DetLimitSideLength = detLimit,
             AutoScaleFromCpu = autoScale,
             ProcessorCount = cores,
+            WeChatOcrPath = FirstSet(Environment.GetEnvironmentVariable("MINIOCR_WECHAT_OCR_PATH"), ocr.WeChatOcrPath),
+            WeChatDir = FirstSet(Environment.GetEnvironmentVariable("MINIOCR_WECHAT_DIR"), ocr.WeChatDir),
+            WeChatInstances = wechatInstances,
+            WeChatFallbackToLocal = wechatFallback,
+            WeChatConnectTimeoutSeconds = Math.Clamp(connectTimeout, 3, 180),
+            WeChatRequestTimeoutSeconds = Math.Clamp(requestTimeout, 5, 300),
         };
     }
 
@@ -176,11 +222,16 @@ public sealed class OcrRuntimeConfig
         return autoScale ? autoDefault : fixedFallback;
     }
 
-    /// <summary>Copy with a different OCR mode (e.g. llm→local fallback).</summary>
-    public OcrRuntimeConfig WithMode(string mode) => new()
+    /// <summary>
+    /// Copy with an explicit mode. Does not re-read <c>MINIOCR_OCR_MODE</c>, so a
+    /// startup fallback to local stays local even when the env var requested wechat or llm.
+    /// </summary>
+    public OcrRuntimeConfig WithMode(string mode) => With(mode: CanonicalMode(mode));
+
+    public OcrRuntimeConfig With(string? mode = null, int? engineCount = null, int? wechatInstances = null) => new()
     {
-        Mode = ResolveMode(mode),
-        EngineCount = EngineCount,
+        Mode = mode is null ? Mode : CanonicalMode(mode),
+        EngineCount = engineCount ?? EngineCount,
         DefaultDpi = DefaultDpi,
         LineWorkerCount = LineWorkerCount,
         DetIntraOpThreads = DetIntraOpThreads,
@@ -190,22 +241,47 @@ public sealed class OcrRuntimeConfig
         DetLimitSideLength = DetLimitSideLength,
         AutoScaleFromCpu = AutoScaleFromCpu,
         ProcessorCount = ProcessorCount,
+        WeChatOcrPath = WeChatOcrPath,
+        WeChatDir = WeChatDir,
+        WeChatInstances = wechatInstances ?? WeChatInstances,
+        WeChatFallbackToLocal = WeChatFallbackToLocal,
+        WeChatConnectTimeoutSeconds = WeChatConnectTimeoutSeconds,
+        WeChatRequestTimeoutSeconds = WeChatRequestTimeoutSeconds,
     };
 
     public bool IsLlmMode =>
         string.Equals(Mode, "llm", StringComparison.OrdinalIgnoreCase);
 
+    public bool IsWeChatMode =>
+        string.Equals(Mode, "wechat", StringComparison.OrdinalIgnoreCase);
+
     /// <summary>
-    /// Env MINIOCR_OCR_MODE overrides file. Accepts local|llm (case-insensitive).
+    /// Env MINIOCR_OCR_MODE overrides file. Accepts local|llm|wechat (case-insensitive).
     /// Unknown values fall back to local.
     /// </summary>
     public static string ResolveMode(string? fileMode)
     {
         string? env = Environment.GetEnvironmentVariable("MINIOCR_OCR_MODE");
         string raw = !string.IsNullOrWhiteSpace(env) ? env.Trim() : (fileMode ?? "local");
+        return CanonicalMode(raw);
+    }
+
+    public static string CanonicalMode(string? raw)
+    {
         if (string.Equals(raw, "llm", StringComparison.OrdinalIgnoreCase))
             return "llm";
+        if (string.Equals(raw, "wechat", StringComparison.OrdinalIgnoreCase))
+            return "wechat";
         return "local";
+    }
+
+    private static string? FirstSet(string? envValue, string? fileValue)
+    {
+        if (!string.IsNullOrWhiteSpace(envValue))
+            return envValue.Trim();
+        if (!string.IsNullOrWhiteSpace(fileValue))
+            return fileValue.Trim();
+        return null;
     }
 
     private static int ReadInt(string name, int fallback)

@@ -8,6 +8,9 @@ namespace MiniOcr;
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
     WriteIndented = false)]
 [JsonSerializable(typeof(OcrDebugRequest))]
+[JsonSerializable(typeof(OcrTextDebugResponse))]
+[JsonSerializable(typeof(OcrTextDebugPage))]
+[JsonSerializable(typeof(List<OcrTextDebugPage>))]
 [JsonSerializable(typeof(OcrResponse))]
 [JsonSerializable(typeof(OcrPageResult))]
 [JsonSerializable(typeof(OcrTimings))]

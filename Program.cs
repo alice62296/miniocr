@@ -5,6 +5,16 @@ using MiniOcr.Services;
 
 WebApplicationBuilder builder = WebApplication.CreateSlimBuilder(args);
 
+builder.WebHost.ConfigureKestrel(options =>
+{
+    options.Limits.MaxRequestBodySize = 300L * 1024 * 1024;
+});
+builder.Services.Configure<Microsoft.AspNetCore.Http.Features.FormOptions>(options =>
+{
+    options.MultipartBodyLengthLimit = 300L * 1024 * 1024;
+    options.ValueLengthLimit = 32 * 1024;
+});
+
 builder.Services.ConfigureHttpJsonOptions(options =>
 {
     options.SerializerOptions.TypeInfoResolverChain.Insert(0, AppJsonContext.Default);
@@ -37,12 +47,79 @@ bool configFileExisted = configLoad.ConfigFileExisted;
 LlmRuntimeConfig llmConfig = AppConfigStore.ResolveLlm(appConfig);
 OcrRuntimeConfig runtimeConfig = OcrRuntimeConfig.FromAppConfig(appConfig);
 
+if (OcrCompareRunner.IsRequested(args))
+{
+    Environment.ExitCode = await OcrCompareRunner.RunAsync(args, appConfig, bootstrapLogs);
+    return;
+}
+
 // ocr.mode=llm needs a usable LLM; otherwise fall back to local with a clear warning.
 if (runtimeConfig.IsLlmMode && !llmConfig.IsUsable)
 {
     bootstrapLogger.LogWarning(
         "ocr.mode=llm but LLM is not usable (need llm.enabled + apiKey + baseUrl + model); falling back to local Paddle OCR");
     runtimeConfig = runtimeConfig.WithMode("local");
+}
+
+WeChatOcrEngine? wechatEngine = null;
+string wechatStatus = "off";
+if (runtimeConfig.IsWeChatMode)
+{
+    WeChatOcrLocation location = WeChatOcrLocator.Locate(
+        WeChatLocateInput.FromConfig(runtimeConfig),
+        FileSystemWeChatProbe.Instance);
+    Console.WriteLine(location.Report);
+    WeChatStartupDecision decision = WeChatStartup.Decide(
+        WeChatStartup.IsWindowsX64(),
+        location,
+        runtimeConfig.WeChatFallbackToLocal);
+    if (!decision.Ready)
+    {
+        string banner = decision.Message +
+            (decision.FailProcess
+                ? "\nRefusing to start. Set ocr.wechatFallbackToLocal=true or MINIOCR_WECHAT_FALLBACK=1 to use local Paddle instead."
+                : "\nFalling back to local Paddle OCR.");
+        Console.Error.WriteLine(banner);
+        bootstrapLogger.LogWarning("{Message}", banner);
+        if (decision.FailProcess)
+        {
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        wechatStatus = "fallback: " + FirstLine(decision.Message);
+        runtimeConfig = runtimeConfig.WithMode("local");
+    }
+    else
+    {
+        try
+        {
+            wechatEngine = await WeChatOcrEngine.ConnectAsync(
+                location,
+                runtimeConfig,
+                bootstrapLogs.CreateLogger<WeChatOcrEngine>(),
+                CancellationToken.None);
+            wechatStatus = "ready";
+        }
+        catch (Exception ex)
+        {
+            string banner =
+                "ocr.mode=wechat failed to connect: " + ex.Message +
+                (runtimeConfig.WeChatFallbackToLocal
+                    ? "\nFalling back to local Paddle OCR."
+                    : "\nRefusing to start. Set ocr.wechatFallbackToLocal=true or MINIOCR_WECHAT_FALLBACK=1 to use local Paddle instead.");
+            Console.Error.WriteLine(banner);
+            bootstrapLogger.LogWarning(ex, "WeChat OCR connect failed");
+            if (!runtimeConfig.WeChatFallbackToLocal)
+            {
+                Environment.ExitCode = 1;
+                return;
+            }
+
+            wechatStatus = "fallback: " + FirstLine(ex.Message);
+            runtimeConfig = runtimeConfig.WithMode("local");
+        }
+    }
 }
 
 string apiKeyStatus = string.IsNullOrEmpty(llmConfig.ApiKey) ? "(empty)" : "(set)";
@@ -57,7 +134,8 @@ Console.WriteLine(
 Console.WriteLine(
     $"OCR mode={runtimeConfig.Mode}, knobs: engines={runtimeConfig.EngineCount}, dpi={runtimeConfig.DefaultDpi}, " +
     $"lineWorkers={runtimeConfig.LineWorkerCount}, detThreads={runtimeConfig.DetIntraOpThreads}, " +
-    $"useCls={runtimeConfig.UseDirectionClassification}, rasterWorkers={runtimeConfig.RasterWorkerCount}");
+    $"useCls={runtimeConfig.UseDirectionClassification}, rasterWorkers={runtimeConfig.RasterWorkerCount}, " +
+    $"wechatInstances={runtimeConfig.WeChatInstances}, wechatStatus={wechatStatus}");
 Console.WriteLine(
     $"LLM: enabled={llmConfig.Enabled}, usable={llmConfig.IsUsable}, " +
     $"model={llmConfig.Model}, baseUrl={llmConfig.BaseUrl}, " +
@@ -71,6 +149,11 @@ if (llmOcrMode)
 {
     Console.WriteLine("Skipping ChineseV6Tiny / PaddleOcrAll — ocr.mode=llm (vision OCR).");
 }
+else if (runtimeConfig.IsWeChatMode)
+{
+    Console.WriteLine(
+        $"Skipping ChineseV6Tiny / PaddleOcrAll — ocr.mode=wechat ({wechatEngine?.KindName}, instances={wechatEngine?.InstanceCount ?? 0}).");
+}
 else
 {
     Console.WriteLine("Loading ChineseV6Tiny OCR models...");
@@ -83,6 +166,8 @@ builder.Services.AddSingleton(runtimeConfig);
 builder.Services.AddSingleton(llmConfig);
 if (engine is not null)
     builder.Services.AddSingleton(engine);
+if (wechatEngine is not null)
+    builder.Services.AddSingleton(wechatEngine);
 
 builder.Services.AddHttpClient(nameof(LlmEntityExtractor), (sp, client) =>
 {
@@ -124,7 +209,8 @@ builder.Services.AddSingleton<PdfOcrPipeline>(sp =>
         sp.GetRequiredService<ILogger<PdfOcrPipeline>>(),
         engine: sp.GetService<OcrEngine>(),
         llm: sp.GetService<LlmEntityExtractor>(),
-        vision: sp.GetService<LlmVisionOcr>());
+        vision: sp.GetService<LlmVisionOcr>(),
+        wechat: sp.GetService<WeChatOcrEngine>());
 });
 builder.Services.AddSingleton<ChallengeJobService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<ChallengeJobService>());
@@ -137,6 +223,8 @@ lifetime.ApplicationStopping.Register(() =>
 {
     if (engine is not null)
         engine.DisposeAsync().AsTask().GetAwaiter().GetResult();
+    if (wechatEngine is not null)
+        wechatEngine.DisposeAsync().AsTask().GetAwaiter().GetResult();
 });
 
 app.MapGet("/health", (IServiceProvider sp) =>
@@ -151,7 +239,7 @@ app.MapGet("/health", (IServiceProvider sp) =>
             ModelsLoaded = ocr?.IsLoaded ?? false,
             Runtime = RuntimeInformation.FrameworkDescription,
             ProcessorCount = cfg.ProcessorCount,
-            EngineCount = ocr?.EngineCount ?? 0,
+            EngineCount = ocr?.EngineCount ?? wechatEngine?.InstanceCount ?? 0,
             LineWorkerCount = ocr?.LineWorkerCount ?? 0,
             DetIntraOpThreads = ocr?.DetIntraOpThreads ?? 0,
             DefaultDpi = cfg.DefaultDpi,
@@ -164,6 +252,11 @@ app.MapGet("/health", (IServiceProvider sp) =>
             ConfigFileExisted = configFileExisted,
             ConfigPathSource = configLoad.PathSource,
             OcrMode = cfg.Mode,
+            WeChatKind = wechatEngine?.KindName ?? "",
+            WeChatPluginPath = wechatEngine?.PluginPath ?? "",
+            WeChatDir = wechatEngine?.WeChatDir ?? "",
+            WeChatInstances = wechatEngine?.InstanceCount ?? 0,
+            WeChatStatus = wechatStatus,
             LlmOcrConcurrency = llm.OcrConcurrency,
             LlmEnabled = llm.Enabled,
             LlmUsable = llm.IsUsable,
@@ -352,20 +445,6 @@ app.MapPost("/ocr", async Task<IResult> (
         files.Add(new ChallengeFileRef { FileId = "f1", Url = body.Url.Trim() });
     }
 
-    if (files.Count == 0)
-    {
-        return Results.Json(
-            new ChallengeAckResponse
-            {
-                Ok = false,
-                Error =
-                    "Required: files[{fileId,url}] (competition shape), or legacy { url, dpi? }. " +
-                    "Optional: teamId, key, callbackUrl (ignored for sync).",
-            },
-            AppJsonContext.Default.ChallengeAckResponse,
-            statusCode: StatusCodes.Status400BadRequest);
-    }
-
     int? dpi = body.Dpi;
     if (dpi is null &&
         httpRequest.Query.TryGetValue("dpi", out var dpiQuery) &&
@@ -375,8 +454,53 @@ app.MapPost("/ocr", async Task<IResult> (
     }
 
     dpi ??= config.DefaultDpi;
+    bool verbose = WantsVerbose(httpRequest);
+
+    if (files.Count == 0 && !string.IsNullOrWhiteSpace(body.Path))
+    {
+        try
+        {
+            byte[] pdf = LocalPdfFile.ReadAllBytes(body.Path);
+            using RentedBuffer buffer = LocalPdfFile.RentCopy(pdf);
+            OcrResponse ocr = await pipeline
+                .ProcessAsync(buffer, downloadMs: 0, downloadMode: "local-file", ct, dpi)
+                .ConfigureAwait(false);
+            return FinishDebug(body.TeamId, body.Key, "f1", ocr, verbose, config.Mode);
+        }
+        catch (Exception ex) when (ex is ArgumentException or FileNotFoundException or InvalidOperationException)
+        {
+            return Results.Json(
+                new ChallengeAckResponse { Ok = false, Error = ex.Message },
+                AppJsonContext.Default.ChallengeAckResponse,
+                statusCode: StatusCodes.Status400BadRequest);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Debug /ocr local path failed");
+            return Results.Json(
+                new ChallengeAckResponse { Ok = false, Error = "OCR failed: " + ex.Message },
+                AppJsonContext.Default.ChallengeAckResponse,
+                statusCode: StatusCodes.Status500InternalServerError);
+        }
+    }
+
+    if (files.Count == 0)
+    {
+        return Results.Json(
+            new ChallengeAckResponse
+            {
+                Ok = false,
+                Error =
+                    "Required: files[{fileId,url}] (competition shape), legacy { url, dpi? }, " +
+                    "or { path } (local PDF, non-ASCII paths ok). " +
+                    "Optional: teamId, key, callbackUrl (ignored for sync). Add ?verbose=1 for page text and ms/page.",
+            },
+            AppJsonContext.Default.ChallengeAckResponse,
+            statusCode: StatusCodes.Status400BadRequest);
+    }
 
     List<ChallengeFileResult> results = [];
+    OcrResponse? single = null;
     try
     {
         foreach (ChallengeFileRef file in files)
@@ -390,6 +514,8 @@ app.MapPost("/ocr", async Task<IResult> (
                 OcrResponse ocr = await pipeline
                     .ProcessAsync(download.Buffer, download.ElapsedMs, download.Mode, ct, dpi)
                     .ConfigureAwait(false);
+                if (files.Count == 1)
+                    single = ocr;
                 results.Add(ChallengeResultMapper.BuildFileResult(fileId, ocr));
             }
         }
@@ -425,6 +551,9 @@ app.MapPost("/ocr", async Task<IResult> (
             statusCode: StatusCodes.Status500InternalServerError);
     }
 
+    if (verbose && single is not null)
+        return FinishDebug(body.TeamId, body.Key, files[0].FileId ?? "f1", single, verbose: true, config.Mode);
+
     ChallengeCallbackBody callbackShaped = new()
     {
         TeamId = body.TeamId,
@@ -434,6 +563,128 @@ app.MapPost("/ocr", async Task<IResult> (
     return Results.Json(callbackShaped, AppJsonContext.Default.ChallengeCallbackBody);
 });
 
+app.MapPost("/ocr/upload", async Task<IResult> (
+    HttpRequest httpRequest,
+    PdfOcrPipeline pipeline,
+    OcrRuntimeConfig config,
+    CancellationToken ct) =>
+{
+    if (!httpRequest.HasFormContentType)
+    {
+        return Results.Json(
+            new ChallengeAckResponse
+            {
+                Ok = false,
+                Error = "POST /ocr/upload expects multipart/form-data with a file field, or a path field.",
+            },
+            AppJsonContext.Default.ChallengeAckResponse,
+            statusCode: StatusCodes.Status400BadRequest);
+    }
+
+    IFormCollection form;
+    try
+    {
+        form = await httpRequest.ReadFormAsync(ct).ConfigureAwait(false);
+    }
+    catch (Exception ex)
+    {
+        logger.LogWarning(ex, "Debug /ocr/upload form parse failed");
+        return Results.Json(
+            new ChallengeAckResponse { Ok = false, Error = "Invalid multipart body: " + ex.Message },
+            AppJsonContext.Default.ChallengeAckResponse,
+            statusCode: StatusCodes.Status400BadRequest);
+    }
+
+    int? dpi = null;
+    if (form.TryGetValue("dpi", out Microsoft.Extensions.Primitives.StringValues dpiForm) &&
+        int.TryParse(dpiForm.FirstOrDefault(), out int dpiFromForm))
+    {
+        dpi = dpiFromForm;
+    }
+
+    if (dpi is null &&
+        httpRequest.Query.TryGetValue("dpi", out Microsoft.Extensions.Primitives.StringValues dpiQuery) &&
+        int.TryParse(dpiQuery.FirstOrDefault(), out int dpiFromQuery))
+    {
+        dpi = dpiFromQuery;
+    }
+
+    dpi ??= config.DefaultDpi;
+    bool verbose = WantsVerbose(httpRequest);
+
+    try
+    {
+        byte[] pdf;
+        if (form.Files.Count > 0)
+        {
+            IFormFile file = form.Files[0];
+            if (file.Length > LocalPdfFile.MaxBytes)
+            {
+                return Results.Json(
+                    new ChallengeAckResponse { Ok = false, Error = "PDF exceeds 300 MB." },
+                    AppJsonContext.Default.ChallengeAckResponse,
+                    statusCode: StatusCodes.Status400BadRequest);
+            }
+
+            using var mem = new MemoryStream(file.Length > int.MaxValue ? 0 : (int)Math.Max(0, file.Length));
+            await file.CopyToAsync(mem, ct).ConfigureAwait(false);
+            pdf = mem.ToArray();
+            if (!LocalPdfFile.LooksLikePdf(pdf))
+            {
+                return Results.Json(
+                    new ChallengeAckResponse { Ok = false, Error = "Upload is not a PDF (missing %PDF header)." },
+                    AppJsonContext.Default.ChallengeAckResponse,
+                    statusCode: StatusCodes.Status400BadRequest);
+            }
+
+            logger.LogInformation(
+                "OCR upload: fileName={Name} bytes={Bytes}",
+                file.FileName,
+                pdf.Length);
+        }
+        else if (form.TryGetValue("path", out Microsoft.Extensions.Primitives.StringValues pathVal) &&
+                 !string.IsNullOrWhiteSpace(pathVal.FirstOrDefault()))
+        {
+            pdf = LocalPdfFile.ReadAllBytes(pathVal.ToString());
+        }
+        else
+        {
+            return Results.Json(
+                new ChallengeAckResponse { Ok = false, Error = "Provide a file field or a path field." },
+                AppJsonContext.Default.ChallengeAckResponse,
+                statusCode: StatusCodes.Status400BadRequest);
+        }
+
+        using RentedBuffer buffer = LocalPdfFile.RentCopy(pdf);
+        OcrResponse ocr = await pipeline
+            .ProcessAsync(buffer, downloadMs: 0, downloadMode: "upload", ct, dpi)
+            .ConfigureAwait(false);
+        string fileId = "f1";
+        if (form.TryGetValue("fileId", out Microsoft.Extensions.Primitives.StringValues idVal) &&
+            !string.IsNullOrWhiteSpace(idVal.FirstOrDefault()))
+        {
+            fileId = idVal.ToString();
+        }
+
+        return FinishDebug(teamId: 0, key: "debug", fileId, ocr, verbose, config.Mode);
+    }
+    catch (Exception ex) when (ex is ArgumentException or FileNotFoundException or InvalidOperationException)
+    {
+        return Results.Json(
+            new ChallengeAckResponse { Ok = false, Error = ex.Message },
+            AppJsonContext.Default.ChallengeAckResponse,
+            statusCode: StatusCodes.Status400BadRequest);
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "Debug /ocr/upload failed");
+        return Results.Json(
+            new ChallengeAckResponse { Ok = false, Error = "OCR failed: " + ex.Message },
+            AppJsonContext.Default.ChallengeAckResponse,
+            statusCode: StatusCodes.Status500InternalServerError);
+    }
+});
+
 app.MapGet("/", () => Results.Text(
     "MiniOcr AOT API\n" +
     "POST /challenge  ← competition serviceUrl (also POST /)\n" +
@@ -441,12 +692,16 @@ app.MapGet("/", () => Results.Text(
     "  → HTTP 200 {\"ok\":true} immediately; results POSTed async to callbackUrl\n" +
     "POST /ocr        debug sync OCR (competition shapes; response = callback body)\n" +
     "  {\"teamId\":0,\"key\":\"debug\",\"files\":[{\"fileId\":\"f1\",\"url\":\"https://...pdf\"}]}\n" +
-    "  or legacy {\"url\":\"https://.../file.pdf\"} / ?dpi=96\n" +
+    "  or legacy {\"url\":\"https://.../file.pdf\"} or {\"path\":\"C:\\\\...\\\\file.pdf\"} / ?dpi=96\n" +
+    "  ?verbose=1 (or ?text=1) returns per-page text and ms/page instead of the callback shape\n" +
+    "POST /ocr/upload multipart file field, or form field path= (local PDF, Unicode paths ok)\n" +
     "GET  /health\n" +
+    "CLI  MiniOcr --compare <pdf> [--pages N] [--dpi N]   wechat vs local → wechat-vs-local.txt\n" +
     $"Config: path={configPath} existed={configFileExisted} source={configLoad.PathSource} " +
-    $"ocr.mode={runtimeConfig.Mode} llm.usable={llmConfig.IsUsable} apiKey={apiKeyStatus}\n" +
+    $"ocr.mode={runtimeConfig.Mode} wechat={wechatStatus} llm.usable={llmConfig.IsUsable} apiKey={apiKeyStatus}\n" +
     "Env CONFIG: MINIOCR_CONFIG_PATH\n" +
     "Env OCR: MINIOCR_OCR_MODE MINIOCR_ENGINES MINIOCR_DPI MINIOCR_LINE_WORKERS MINIOCR_DET_THREADS MINIOCR_USE_CLS MINIOCR_RASTER_WORKERS\n" +
+    "Env WECHAT: MINIOCR_WECHAT_OCR_PATH MINIOCR_WECHAT_DIR MINIOCR_WECHAT_INSTANCES MINIOCR_WECHAT_FALLBACK\n" +
     "Env LLM: MINIOCR_LLM_API_KEY MINIOCR_LLM_BASE_URL MINIOCR_LLM_MODEL MINIOCR_LLM_MAX_CONCURRENCY MINIOCR_LLM_PAGES_PER_REQUEST MINIOCR_LLM_OCR_CONCURRENCY MINIOCR_LLM_THINKING\n",
     "text/plain; charset=utf-8"));
 
@@ -464,5 +719,33 @@ logger.LogInformation(
     llmConfig.IsUsable,
     llmConfig.OcrConcurrency,
     urls);
+
+static string FirstLine(string message)
+{
+    int cut = message.IndexOfAny(['\r', '\n']);
+    string line = cut < 0 ? message : message[..cut];
+    return line.Length <= 240 ? line : line[..240];
+}
+
+static bool WantsVerbose(HttpRequest request) =>
+    request.Query.ContainsKey("verbose") || request.Query.ContainsKey("text");
+
+static IResult FinishDebug(int teamId, string? key, string fileId, OcrResponse ocr, bool verbose, string mode)
+{
+    if (verbose)
+    {
+        return Results.Json(
+            OcrTextDebug.From(ocr, mode),
+            AppJsonContext.Default.OcrTextDebugResponse);
+    }
+
+    ChallengeCallbackBody callbackShaped = new()
+    {
+        TeamId = teamId,
+        Key = string.IsNullOrWhiteSpace(key) ? "debug" : key.Trim(),
+        Result = [ChallengeResultMapper.BuildFileResult(fileId, ocr)],
+    };
+    return Results.Json(callbackShaped, AppJsonContext.Default.ChallengeCallbackBody);
+}
 
 await app.RunAsync();

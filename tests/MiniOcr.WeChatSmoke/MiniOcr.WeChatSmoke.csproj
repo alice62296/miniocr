@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net11.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>MiniOcr.WeChatSmoke</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <PublishAot>false</PublishAot>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\..\Services\WeChat\WeChatOcrKind.cs" Link="WeChatOcrKind.cs" />
+    <Compile Include="..\..\Services\WeChat\WeChatProtobuf.cs" Link="WeChatProtobuf.cs" />
+    <Compile Include="..\..\Services\WeChat\IWeChatPathProbe.cs" Link="IWeChatPathProbe.cs" />
+    <Compile Include="..\..\Services\WeChat\WeChatOcrLocator.cs" Link="WeChatOcrLocator.cs" />
+    <Compile Include="..\..\Services\WeChat\WeChatRegistryReader.cs" Link="WeChatRegistryReader.cs" />
+    <Compile Include="..\..\Services\WeChat\WeChatOcrPool.cs" Link="WeChatOcrPool.cs" />
+    <Compile Include="..\..\Services\WeChat\WeChatStartup.cs" Link="WeChatStartup.cs" />
+    <Compile Include="..\..\Services\LocalPdfFile.cs" Link="LocalPdfFile.cs" />
+    <Compile Include="..\..\Services\RentedBuffer.cs" Link="RentedBuffer.cs" />
+    <Compile Include="..\..\Services\OcrRuntimeConfig.cs" Link="OcrRuntimeConfig.cs" />
+    <Compile Include="..\..\Models\AppConfigModels.cs" Link="AppConfigModels.cs" />
+    <Compile Include="..\..\Models\ChallengeModels.cs" Link="ChallengeModels.cs" />
+  </ItemGroup>
+
+</Project>

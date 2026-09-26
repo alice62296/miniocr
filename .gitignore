@@ -36,6 +36,9 @@ Thumbs.db
 .venv*/
 artifacts
 
+# wechat vs local benchmark paste file
+wechat-vs-local.txt
+
 # large local bench artifacts
 samples/sample-2000.pdf
 samples/sample-50.pdf
