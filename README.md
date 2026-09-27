@@ -658,14 +658,15 @@ The current CPU is missing one or more of the required instruction sets.
 
 | 跑法 | 墙钟 | 提交页数 | 文本哈希 |
 | --- | --- | --- | --- |
-| 单机，5 页 | 2175 ms | — | `ebff69493a49e0ed8b01d52587c71ef3295abd8e326e718771f11c511f77e6d0` |
-| 单机，20 页 | 5333 ms | — | `0f89d18fbf7b5cc23f62d6348cbaedbec505e10c84f3339a250092e32d008f6a` |
-| 三节点，5 页 | 2329 ms | coord 3 / worker-a 1 / worker-b 1 | 与单机相同 |
-| 三节点，20 页，`joinGraceMs=500`（默认） | 4647 ms | 9 / 5 / 6 | 与单机相同 |
-| 三节点，20 页，`joinGraceMs=20000`（测试把协调节点按住） | 3932 ms | 1 / 9 / 10 | 与单机相同 |
-| 同上，中途杀掉 worker-b | 5575 ms | coord 1 / worker-a 19（worker-b 提交 0，页被重做） | 与单机相同 |
+| 单机，5 页 | 2233 ms | — | `ebff69493a49e0ed8b01d52587c71ef3295abd8e326e718771f11c511f77e6d0` |
+| 单机，20 页 | 5203 ms | — | `0f89d18fbf7b5cc23f62d6348cbaedbec505e10c84f3339a250092e32d008f6a` |
+| 三节点，5 页 | 2190 ms | coord 3 / worker-a 1 / worker-b 1 | 与单机相同 |
+| 三节点，20 页，`joinGraceMs=20000`（`ClusterLive` 把协调节点按住） | 3960 ms | coord 1 / worker-a 10 / worker-b 9 | 与单机相同 |
+| 同上，中途杀掉 worker-b | 4851 ms | coord 1 / worker-a 19（worker-b 提交 0，页被重做） | 与单机相同 |
 
-20 页、每批 1 页时，领页 HTTP 和每台打开 PDF 的固定开销还压得过 OCR，所以 3 个单核节点大约 1.15×（默认宽限）到 1.36×（协调节点让出），不是 3×。页数到几百、两千时，OCR 会盖过这些开销。`tests/MiniOcr.ClusterLive` 用 20 秒宽限，是为了让 5 页样例也能摊到工人上；默认 500 ms 适合大文档。
+另一次把 `joinGraceMs` 改成默认 500：20 页 4647 ms，提交页 coord 9 / worker-a 5 / worker-b 6，哈希仍是上面的 20 页值（那次单机 20 页是 5333 ms）。
+
+20 页、每批 1 页时，领页 HTTP 和每台打开 PDF 的固定开销还压得过 OCR，所以 3 个单核节点大约 1.15×（默认宽限）到 1.31×（协调节点让出），不是 3×。页数到几百、两千时，OCR 会盖过这些开销。`tests/MiniOcr.ClusterLive` 用 20 秒宽限，是为了让 5 页样例也能摊到工人上；默认 500 ms 适合大文档。
 
 ### 配置
 
