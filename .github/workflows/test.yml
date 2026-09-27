@@ -1,0 +1,30 @@
+# Fast managed smoke tests. Native AOT publish stays in publish.yml and is unchanged
+# per RID: WeChat OCR is pure C# and does not add a native build for win-x64 or any other RID.
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 11 RC
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "11.0.x"
+          dotnet-quality: preview
+
+      - name: WeChat OCR detection and protobuf
+        run: dotnet run -c Release --project tests/MiniOcr.WeChatSmoke
+
+      - name: Entity extractor
+        run: dotnet run -c Release --project tests/MiniOcr.EntitySmoke
+
+      - name: Config path
+        run: dotnet run -c Release --project tests/MiniOcr.ConfigPathSmoke

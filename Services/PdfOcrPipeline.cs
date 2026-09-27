@@ -10,6 +10,7 @@ namespace MiniOcr.Services;
 public sealed class PdfOcrPipeline
 {
     private readonly OcrEngine? _engine;
+    private readonly WeChatOcrEngine? _wechat;
     private readonly ILogger<PdfOcrPipeline> _logger;
     private readonly LlmEntityExtractor? _llm;
     private readonly LlmVisionOcr? _vision;
@@ -23,11 +24,13 @@ public sealed class PdfOcrPipeline
         ILogger<PdfOcrPipeline> logger,
         OcrEngine? engine = null,
         LlmEntityExtractor? llm = null,
-        LlmVisionOcr? vision = null)
+        LlmVisionOcr? vision = null,
+        WeChatOcrEngine? wechat = null)
     {
         _config = config;
         _logger = logger;
         _engine = engine;
+        _wechat = wechat;
         _llm = llm;
         _vision = vision;
         _defaultDpi = config.DefaultDpi;
@@ -39,6 +42,12 @@ public sealed class PdfOcrPipeline
                 throw new InvalidOperationException(
                     "ocr.mode=llm requires a usable LLM (enabled + apiKey + baseUrl + model).");
             _pageWindow = Math.Max(4, Math.Min(vision.OcrConcurrency, 64));
+        }
+        else if (config.IsWeChatMode)
+        {
+            if (wechat is null || !wechat.IsReady)
+                throw new InvalidOperationException("ocr.mode=wechat requires a connected WeChat OCR engine.");
+            _pageWindow = Math.Max(4, wechat.InstanceCount * 2);
         }
         else
         {
@@ -91,12 +100,28 @@ public sealed class PdfOcrPipeline
                 .ConfigureAwait(false);
         }
 
+        if (_config.IsWeChatMode)
+        {
+            _logger.LogInformation(
+                "OCR pipeline (wechat {Kind}): {Pages} pages, {Bytes} bytes PDF, dpi={Dpi}, instances={Instances}, rasterWorkers={Raster}",
+                _wechat!.KindName, pageCount, pdfByteCount, dpi, _wechat.InstanceCount, _rasterWorkers);
+            return await ProcessWithTextEngineAsync(
+                pdfBytes, pdfByteCount, pageCount, dpi, downloadMs, downloadMode, totalSw, ct,
+                modeLabel: "wechat",
+                workers: _wechat.InstanceCount,
+                recognize: (bitmap, token) => _wechat.RecognizeBitmapAsync(bitmap, token))
+                .ConfigureAwait(false);
+        }
+
         _logger.LogInformation(
             "OCR pipeline (local): {Pages} pages, {Bytes} bytes PDF, dpi={Dpi}, engines={Engines}, rasterWorkers={Raster}",
             pageCount, pdfByteCount, dpi, _engine!.EngineCount, _rasterWorkers);
 
-        return await ProcessWithLocalAsync(
-            pdfBytes, pdfByteCount, pageCount, dpi, downloadMs, downloadMode, totalSw, ct)
+        return await ProcessWithTextEngineAsync(
+            pdfBytes, pdfByteCount, pageCount, dpi, downloadMs, downloadMode, totalSw, ct,
+            modeLabel: "local",
+            workers: _engine.EngineCount,
+            recognize: RecognizeLocalAsync)
             .ConfigureAwait(false);
     }
 
@@ -278,7 +303,34 @@ public sealed class PdfOcrPipeline
         };
     }
 
-    private async Task<OcrResponse> ProcessWithLocalAsync(
+    private async Task<string> RecognizeLocalAsync(SKBitmap bitmap, CancellationToken ct)
+    {
+        EnsureBgra8888(bitmap, out SKBitmap working, out bool ownedWorking);
+        try
+        {
+            int width = working.Width;
+            int height = working.Height;
+            int stride = working.RowBytes;
+            IntPtr pixels = working.GetPixels();
+            int byteCount = stride * height;
+            PaddleOcrResult result = await _engine!.UseAsync(ocr =>
+            {
+                unsafe
+                {
+                    ReadOnlySpan<byte> span = new((void*)pixels, byteCount);
+                    return ocr.Run(span, width, height, stride, ImagePixelFormat.Bgra32);
+                }
+            }, ct).ConfigureAwait(false);
+            return result.Text?.Replace("\r", "").Trim() ?? "";
+        }
+        finally
+        {
+            if (ownedWorking)
+                working.Dispose();
+        }
+    }
+
+    private async Task<OcrResponse> ProcessWithTextEngineAsync(
         byte[] pdfBytes,
         int pdfByteCount,
         int pageCount,
@@ -286,7 +338,10 @@ public sealed class PdfOcrPipeline
         double downloadMs,
         string downloadMode,
         Stopwatch totalSw,
-        CancellationToken ct)
+        CancellationToken ct,
+        string modeLabel,
+        int workers,
+        Func<SKBitmap, CancellationToken, Task<string>> recognize)
     {
         RenderOptions renderOptions = CreateRenderOptions(dpi);
 
@@ -319,57 +374,47 @@ public sealed class PdfOcrPipeline
             {
                 using (bitmap)
                 {
-                    EnsureBgra8888(bitmap, out SKBitmap working, out bool ownedWorking);
-                    try
+                    Stopwatch ocrSw = Stopwatch.StartNew();
+                    int width = bitmap.Width;
+                    int height = bitmap.Height;
+                    string pageText = await recognize(bitmap, ct).ConfigureAwait(false);
+                    ocrSw.Stop();
+                    pageText = pageText.Replace("\r", "").Trim();
+
+                    pages[index] = new OcrPageResult
                     {
-                        Stopwatch ocrSw = Stopwatch.StartNew();
-                        int width = working.Width;
-                        int height = working.Height;
-                        int stride = working.RowBytes;
-                        IntPtr pixels = working.GetPixels();
-                        int byteCount = stride * height;
+                        Page = index + 1,
+                        Width = width,
+                        Height = height,
+                        Text = pageText,
+                        RasterizeMs = Math.Round(rasterMs, 1),
+                        OcrMs = Math.Round(ocrSw.Elapsed.TotalMilliseconds, 1),
+                    };
 
-                        PaddleOcrResult result = await _engine!.UseAsync(ocr =>
-                        {
-                            unsafe
-                            {
-                                ReadOnlySpan<byte> span = new((void*)pixels, byteCount);
-                                return ocr.Run(span, width, height, stride, ImagePixelFormat.Bgra32);
-                            }
-                        }, ct).ConfigureAwait(false);
-                        ocrSw.Stop();
-
-                        string pageText = result.Text?.Replace("\r", "").Trim() ?? "";
-                        pages[index] = new OcrPageResult
-                        {
-                            Page = index + 1,
-                            Width = width,
-                            Height = height,
-                            Text = pageText,
-                            RasterizeMs = Math.Round(rasterMs, 1),
-                            OcrMs = Math.Round(ocrSw.Elapsed.TotalMilliseconds, 1),
-                        };
-
-                        lock (timingLock)
-                        {
-                            rasterTotal += rasterMs;
-                            ocrTotal += ocrSw.Elapsed.TotalMilliseconds;
-                        }
-
-                        // Queue a 10-page NER group as soon as those pages exist,
-                        // while later pages are still in OCR.
-                        ner?.Add(pages[index]);
-                    }
-                    finally
+                    lock (timingLock)
                     {
-                        if (ownedWorking)
-                            working.Dispose();
+                        rasterTotal += rasterMs;
+                        ocrTotal += ocrSw.Elapsed.TotalMilliseconds;
                     }
+
+                    if (string.Equals(modeLabel, "wechat", StringComparison.Ordinal))
+                    {
+                        _logger.LogInformation(
+                            "WeChat OCR page {Page}/{Total} ocrMs={Ms:F1} chars={Chars}",
+                            index + 1,
+                            pageCount,
+                            ocrSw.Elapsed.TotalMilliseconds,
+                            pageText.Length);
+                    }
+
+                    // Queue a 10-page NER group as soon as those pages exist,
+                    // while later pages are still in OCR.
+                    ner?.Add(pages[index]);
                 }
             }
         }
 
-        Task[] consumers = Enumerable.Range(0, _engine!.EngineCount)
+        Task[] consumers = Enumerable.Range(0, Math.Max(1, workers))
             .Select(_ => ConsumerAsync())
             .ToArray();
 
@@ -416,6 +461,30 @@ public sealed class PdfOcrPipeline
         List<OcrPageResult> visible = VisiblePages(pages);
 
         totalSw.Stop();
+
+        if (string.Equals(modeLabel, "wechat", StringComparison.Ordinal))
+        {
+            double msPerPage = pageCount > 0 ? ocrTotal / pageCount : 0;
+            string preview = "";
+            foreach (OcrPageResult page in pages)
+            {
+                if (!string.IsNullOrWhiteSpace(page.Text))
+                {
+                    preview = page.Text.Length <= 120 ? page.Text : page.Text[..120];
+                    preview = preview.Replace('\n', ' ');
+                    break;
+                }
+            }
+
+            _logger.LogInformation(
+                "WeChat OCR done: kind={Kind} instances={Instances} pages={Pages} ocrMs={Ocr:F1} ms/page={Avg:F1} preview={Preview}",
+                _wechat!.KindName,
+                _wechat.InstanceCount,
+                pageCount,
+                ocrTotal,
+                msPerPage,
+                preview);
+        }
 
         return new OcrResponse
         {

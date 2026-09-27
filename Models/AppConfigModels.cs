@@ -43,7 +43,7 @@ public sealed class LlmFileConfig
 
 public sealed class OcrFileConfig
 {
-    /// <summary><c>local</c> (Paddle) or <c>llm</c> (vision chat completions). Default local.</summary>
+    /// <summary><c>local</c> (Paddle), <c>llm</c> (vision), or <c>wechat</c> (Windows x64 plugin). Default local.</summary>
     public string Mode { get; set; } = "local";
     public int? Dpi { get; set; }
     public int? Engines { get; set; }
@@ -52,6 +52,17 @@ public sealed class OcrFileConfig
     public int? RasterWorkers { get; set; }
     public bool? UseCls { get; set; }
     public bool AutoScaleFromCpu { get; set; } = true;
+
+    /// <summary>Full path to WeChatOCR.exe (3.9) or wxocr.dll (4.x). Empty = auto-detect.</summary>
+    public string? WeChatOcrPath { get; set; }
+    /// <summary>WeChat version directory containing mmmojo_64.dll. Empty = auto-detect.</summary>
+    public string? WeChatDir { get; set; }
+    /// <summary>WeChatOCR processes. Null = auto (about ProcessorCount/4, max 3).</summary>
+    public int? WeChatInstances { get; set; }
+    /// <summary>If the plugin is missing or this is not Windows x64, start local Paddle instead. Default true.</summary>
+    public bool WeChatFallbackToLocal { get; set; } = true;
+    public int? WeChatConnectTimeoutSeconds { get; set; }
+    public int? WeChatRequestTimeoutSeconds { get; set; }
 }
 
 /// <summary>Resolved LLM settings after file + env overrides (apiKey never logged).</summary>

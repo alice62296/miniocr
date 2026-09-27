@@ -402,7 +402,13 @@ public static class AppConfigStore
             "detThreads": null,
             "rasterWorkers": null,
             "useCls": false,
-            "autoScaleFromCpu": true
+            "autoScaleFromCpu": true,
+            "wechatOcrPath": "",
+            "wechatDir": "",
+            "wechatInstances": null,
+            "wechatFallbackToLocal": true,
+            "wechatConnectTimeoutSeconds": 20,
+            "wechatRequestTimeoutSeconds": 60
           }
         }
         """;

@@ -17,6 +17,35 @@ public sealed class OcrDebugRequest
 
     /// <summary>Optional per-request raster DPI override (36–300). Defaults to query/env/config.</summary>
     public int? Dpi { get; set; }
+
+    /// <summary>
+    /// Local PDF path for debug (for example a Desktop file with a non-ASCII name).
+    /// Used when <see cref="Files"/> and <see cref="Url"/> are empty.
+    /// </summary>
+    public string? Path { get; set; }
+}
+
+/// <summary>Debug body for <c>POST /ocr?verbose=1</c> and <c>POST /ocr/upload?verbose=1</c>.</summary>
+public sealed class OcrTextDebugResponse
+{
+    public bool Ok { get; set; }
+    public string Mode { get; set; } = "";
+    public string Source { get; set; } = "";
+    public int Dpi { get; set; }
+    public int PageCount { get; set; }
+    public double MsPerPage { get; set; }
+    public OcrTimings Timings { get; set; } = new();
+    public List<OcrTextDebugPage> Pages { get; set; } = [];
+}
+
+public sealed class OcrTextDebugPage
+{
+    public int Page { get; set; }
+    public int Width { get; set; }
+    public int Height { get; set; }
+    public double RasterizeMs { get; set; }
+    public double OcrMs { get; set; }
+    public string Text { get; set; } = "";
 }
 
 public sealed class OcrPageResult
@@ -85,6 +114,12 @@ public sealed class HealthResponse
     public bool ConfigFileExisted { get; set; }
     public string ConfigPathSource { get; set; } = "";
     public string OcrMode { get; set; } = "local";
+    public string WeChatKind { get; set; } = "";
+    public string WeChatPluginPath { get; set; } = "";
+    public string WeChatDir { get; set; } = "";
+    public int WeChatInstances { get; set; }
+    /// <summary><c>off</c>, <c>ready</c>, or a short fallback reason.</summary>
+    public string WeChatStatus { get; set; } = "off";
     public int LlmOcrConcurrency { get; set; }
     public bool LlmEnabled { get; set; }
     public bool LlmUsable { get; set; }

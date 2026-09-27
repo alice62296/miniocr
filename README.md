@@ -8,6 +8,7 @@
 
 - **`local`（默认）**：本地 PP-OCRv6 **ChineseV6Tiny**；实体抽取优先 OpenAI 兼容 LLM NER，可回退启发式。
 - **`llm`**：跳过本地 Paddle 模型加载；将每页 JPEG 以 `image_url` data URL 发给多模态 Chat Completions，一次调用尽量直接返回竞赛形状的 B04/B06 `ruleList`（可配高并发，I/O 密集）。
+- **`wechat`（实验，仅 Windows x64）**：调用本机微信自带 OCR 插件做对比。栅格、按 10 个非空页分组的 LLM NER、协议输出、丢掉空白页都与 `local` 相同。**不要**拿它当竞赛服务端：接口是非官方逆向，有 ToS 风险。详见下方「微信 OCR」。
 
 ## 竞赛协议（serviceUrl）
 
@@ -251,7 +252,13 @@ cd artifacts/linux-x64-singlefile
     "detThreads": null,
     "rasterWorkers": null,
     "useCls": false,
-    "autoScaleFromCpu": true
+    "autoScaleFromCpu": true,
+    "wechatOcrPath": "",
+    "wechatDir": "",
+    "wechatInstances": null,
+    "wechatFallbackToLocal": true,
+    "wechatConnectTimeoutSeconds": 20,
+    "wechatRequestTimeoutSeconds": 60
   }
 }
 ```
@@ -267,6 +274,7 @@ cd artifacts/linux-x64-singlefile
 | --- | --- | --- |
 | `local`（默认） | 加载 ChineseV6Tiny / `PaddleOcrAll`；栅格后本地 OCR；可选 LLM **文本** NER | 离线、控成本、低延迟本机推理 |
 | `llm` | **不加载**本地 Paddle 模型（更快启动、更省 RAM）；栅格→JPEG→多模态 Chat Completions（与视觉 **流水线重叠**） | 有视觉模型配额、希望直接出 B04/B06 |
+| `wechat` | **不加载** Paddle；栅格后把 PNG 交给微信 OCR 插件；文本仍走同一套 LLM NER | 仅在自己的 Windows 笔记本上和 `local` 比速度/文本。非 Windows 或找不到插件时，与 `llm` 一样告警并回退 `local`（`wechatFallbackToLocal: false` 则直接退出） |
 
 设置方式：
 
@@ -298,6 +306,29 @@ cd artifacts/linux-x64-singlefile
 
 `llm.ocrMaxCharsHint`（默认 8000）写入提示词，限制模型返回的页文本长度。
 
+#### 微信 OCR（`ocr.mode=wechat`，实验，仅 Windows x64）
+
+用微信自带 OCR 插件和 ChineseV6Tiny 比同一份 PDF 的耗时与文本。栅格（PDFtoImage）、每 10 个非空页一组的 LLM NER、竞赛协议、丢掉空白页都不变。
+
+这是社区逆向的 mmmojo IPC（参考 [swigger/wechat-ocr](https://github.com/swigger/wechat-ocr)、[EEEEhex/QQImpl](https://github.com/EEEEhex/QQImpl)），**不是**微信公开 API。只适合在你自己的电脑上对比，**不要**部署到竞赛服务器（ToS 风险）。本仓库不附带微信文件；插件必须已经装在本机。
+
+集成方式是**纯托管客户端**：运行时从微信目录加载 `mmmojo_64.dll`，手写 3.9 / 4.x 的 protobuf。没有额外的 `wcocr.dll`，因此 linux / osx / arm 的 Native AOT 发布不用编 C++。上游 C API `wechat_ocr` 是进程内单例，一个 `WeChatOCR` 进程也通常是单线程的，所以并发靠多开进程（`ocr.wechatInstances`），每个进程同时只识别一页。
+
+| 微信 | 插件 | 安装目录（里面要有 `mmmojo_64.dll`） |
+| --- | --- | --- |
+| 3.9.x | `%APPDATA%\Tencent\WeChat\XPlugin\Plugins\WeChatOCR\<ver>\extracted\WeChatOCR.exe` | 常见 `C:\Program Files (x86)\Tencent\WeChat\[3.9.x.x]` |
+| 4.x | `%APPDATA%\Tencent\xwechat\XPlugin\plugins\WeChatOcr\<ver>\extracted\wxocr.dll` | 常见 `C:\Program Files\Tencent\Weixin\<ver>`，旁边的上一级有 `weixin.exe` |
+
+路径留空会按这些位置和卸载注册表自动找，并在启动日志里打印候选和最终选中的路径。非 Windows，或找不到插件 / 握手失败：默认打警告并回退 `local`（和 `llm` 缺 key 一样）。`wechatFallbackToLocal: false` 或 `MINIOCR_WECHAT_FALLBACK=0` 则直接退出。
+
+在 Windows 上对比同一 PDF（单进程、逐页，结果写到当前目录 `wechat-vs-local.txt`）：
+
+```powershell
+.\MiniOcr.exe --compare "C:\Users\mafuz\OneDrive\Desktop\你的文件.pdf" --pages 5 --dpi 96
+```
+
+本机调试本地文件（Unicode 路径）：`POST /ocr` 的 `path`，或 `POST /ocr/upload` 的 multipart。加 `?verbose=1` 会返回每页文本和 ms，而不是竞赛回调形状。PowerShell / curl 示例见文末。
+
 #### 配置 OpenAI / 兼容接口（DeepSeek、Azure、本地）
 
 1. 编辑上述 `config.json`，填入 `llm.apiKey`，按需改 `baseUrl` 与 `model`。
@@ -324,7 +355,11 @@ cd artifacts/linux-x64-singlefile
 
 | 变量 | 文件字段 | 默认（auto-scale，约 8 核） | 说明 |
 | --- | --- | ---: | --- |
-| `MINIOCR_OCR_MODE` | `ocr.mode` | **local** | `local`（Paddle）或 `llm`（视觉；跳过本地模型） |
+| `MINIOCR_OCR_MODE` | `ocr.mode` | **local** | `local`（Paddle）、`llm`（视觉）或 `wechat`（Windows 微信插件） |
+| `MINIOCR_WECHAT_OCR_PATH` | `ocr.wechatOcrPath` | 空（自动） | `WeChatOCR.exe`（3.9）或 `wxocr.dll`（4.x）的完整路径 |
+| `MINIOCR_WECHAT_DIR` | `ocr.wechatDir` | 空（自动） | 含 `mmmojo_64.dll` 的微信版本目录 |
+| `MINIOCR_WECHAT_INSTANCES` | `ocr.wechatInstances` | `Clamp(核数/4, 1, 3)` | 微信 OCR **进程**数。每个进程同时只跑一页 |
+| `MINIOCR_WECHAT_FALLBACK` | `ocr.wechatFallbackToLocal` | **true** | `0/false` 时找不到插件就退出，不回退 Paddle |
 | `MINIOCR_LLM_PAGES_PER_REQUEST` | `llm.pagesPerRequest` | **10**（1–2000） | `local` 文本 NER：每个请求的非空页数 |
 | `MINIOCR_LLM_OCR_CONCURRENCY` | `llm.ocrConcurrency` | **32**（1–256） | `ocr.mode=llm` 时页级视觉并发 |
 | `MINIOCR_LLM_OCR_JPEG_QUALITY` | `llm.ocrJpegQuality` | **70**（40–95） | `ocr.mode=llm` 时页图 JPEG 质量（更低=更快编码/更小上传） |
@@ -415,6 +450,24 @@ curl -sS -X POST http://127.0.0.1:5080/ocr   -H 'Content-Type: application/json'
 
 # 遗留单 URL（仍可用）
 curl -sS -X POST 'http://127.0.0.1:5080/ocr?dpi=96'   -H 'Content-Type: application/json'   -d '{"url":"http://127.0.0.1:8000/sample-multipage.pdf"}' | jq .
+
+# 本地路径（Windows，中文文件名）。verbose=1 返回每页 text 与 ocrMs
+curl.exe -sS -X POST "http://127.0.0.1:5080/ocr?verbose=1" ^
+  -H "Content-Type: application/json; charset=utf-8" ^
+  --data-binary "@body.json"
+
+# 或上传文件
+curl.exe -sS -X POST "http://127.0.0.1:5080/ocr/upload?verbose=1" ^
+  -F "file=@C:\Users\mafuz\OneDrive\Desktop\你的文件.pdf;type=application/pdf"
+```
+
+`body.json` 用 UTF-8（无 BOM）保存，例如 `{"path":"C:\\Users\\mafuz\\OneDrive\\Desktop\\你的文件.pdf","dpi":96}`。PowerShell 5 的 `ConvertTo-Json` 默认编码容易把中文写坏，请用：
+
+```powershell
+$pdf = "C:\Users\mafuz\OneDrive\Desktop\你的文件.pdf"
+$json = '{"path":"' + ($pdf.Replace('\','\\')) + '","dpi":96}'
+[System.IO.File]::WriteAllText("$env:TEMP\ocr-body.json", $json, [System.Text.UTF8Encoding]::new($false))
+curl.exe -sS -X POST "http://127.0.0.1:5080/ocr?verbose=1" -H "Content-Type: application/json; charset=utf-8" --data-binary "@$env:TEMP\ocr-body.json"
 ```
 
 健康检查：
