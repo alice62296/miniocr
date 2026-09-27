@@ -8,6 +8,8 @@ public sealed class AppConfigFile
 {
     public LlmFileConfig? Llm { get; set; }
     public OcrFileConfig? Ocr { get; set; }
+    /// <summary>Optional multi-machine OCR. Missing or <c>enabled: false</c> keeps single-node behavior.</summary>
+    public ClusterFileConfig? Cluster { get; set; }
 }
 
 public sealed class LlmFileConfig

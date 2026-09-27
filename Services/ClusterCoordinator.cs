@@ -1,0 +1,738 @@
+using System.Collections.Concurrent;
+using System.Net.Http.Headers;
+using System.Net.Http.Json;
+using System.Text.Json;
+using MiniOcr;
+using MiniOcr.Models;
+
+namespace MiniOcr.Services;
+
+/// <summary>
+/// One in-flight distributed OCR job. Page text is committed here; the pipeline owns NER.
+/// </summary>
+public sealed class ClusterJob
+{
+    private readonly object _acceptGate = new();
+    private readonly TaskCompletionSource _readersDrained =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private Action<OcrPageResult>? _onAccepted;
+    private int _readers;
+    private int _rejectReads;
+    private int _finished;
+
+    public ClusterJob(
+        string id,
+        ClusterPageScheduler scheduler,
+        byte[] pdf,
+        int pdfLength,
+        int pageCount,
+        int dpi)
+    {
+        Id = id;
+        Scheduler = scheduler;
+        Pdf = pdf;
+        PdfLength = pdfLength;
+        PageCount = pageCount;
+        Dpi = dpi;
+        Started = DateTimeOffset.UtcNow;
+    }
+
+    public string Id { get; }
+    public ClusterPageScheduler Scheduler { get; }
+    public byte[] Pdf { get; }
+    public int PdfLength { get; }
+    public int PageCount { get; }
+    public int Dpi { get; }
+    public DateTimeOffset Started { get; }
+    public ConcurrentDictionary<string, byte> Joined { get; } = new(StringComparer.Ordinal);
+    public bool IsFinished => Volatile.Read(ref _finished) == 1;
+
+    public void SetAccepted(Action<OcrPageResult> onAccepted) => _onAccepted = onAccepted;
+
+    public bool TryAccept(string batchId, OcrPageResult page)
+    {
+        lock (_acceptGate)
+        {
+            if (!Scheduler.TryCommit(batchId, page.Page))
+                return false;
+            _onAccepted?.Invoke(page);
+            return true;
+        }
+    }
+
+    /// <summary>Block until any in-flight <see cref="TryAccept"/> has finished mutating page state.</summary>
+    public void DrainAccepts()
+    {
+        lock (_acceptGate)
+        {
+        }
+    }
+
+    public void MarkFinished() => Volatile.Write(ref _finished, 1);
+
+    public IDisposable? TryEnterPdfRead()
+    {
+        if (Volatile.Read(ref _rejectReads) == 1)
+            return null;
+        Interlocked.Increment(ref _readers);
+        if (Volatile.Read(ref _rejectReads) == 1)
+        {
+            ExitRead();
+            return null;
+        }
+
+        return new PdfRead(this);
+    }
+
+    public void StopNewPdfReads() => Volatile.Write(ref _rejectReads, 1);
+
+    public async Task WaitForPdfReadersAsync(TimeSpan timeout)
+    {
+        if (Volatile.Read(ref _readers) <= 0)
+            return;
+        Task finished = _readersDrained.Task;
+        Task delay = Task.Delay(timeout);
+        await Task.WhenAny(finished, delay).ConfigureAwait(false);
+    }
+
+    private void ExitRead()
+    {
+        if (Interlocked.Decrement(ref _readers) <= 0)
+            _readersDrained.TrySetResult();
+    }
+
+    private sealed class PdfRead : IDisposable
+    {
+        private ClusterJob? _job;
+        public PdfRead(ClusterJob job) => _job = job;
+        public void Dispose() => Interlocked.Exchange(ref _job, null)?.ExitRead();
+    }
+}
+
+/// <summary>
+/// Coordinates pull-based OCR. Each worker downloads the PDF once, then claims page
+/// batches sized by its capacity. The coordinator's own engine pool is the local node.
+/// Images are not shipped: raster stays on the machine that OCRs the page.
+/// </summary>
+public sealed class ClusterCoordinator : IHostedService
+{
+    public const string HttpClientName = "MiniOcr.Cluster";
+    public const int MaxPdfBytes = 300 * 1024 * 1024;
+
+    private readonly ClusterRuntimeConfig _config;
+    private readonly ClusterNodeRegistry _registry;
+    private readonly IHttpClientFactory _httpFactory;
+    private readonly ILogger<ClusterCoordinator> _logger;
+    private readonly ConcurrentDictionary<string, ClusterJob> _jobs = new(StringComparer.Ordinal);
+    private readonly object _publish = new();
+    private readonly CancellationTokenSource _cts = new();
+    private ClusterLastJobHealth? _lastJob;
+    private Task? _healthLoop;
+
+    public ClusterCoordinator(
+        ClusterRuntimeConfig config,
+        ClusterNodeRegistry registry,
+        IHttpClientFactory httpFactory,
+        ILogger<ClusterCoordinator> logger)
+    {
+        _config = config;
+        _registry = registry;
+        _httpFactory = httpFactory;
+        _logger = logger;
+    }
+
+    public bool ShouldDistribute() =>
+        _config.Enabled && _config.IsCoordinator && _registry.HasPotentialRemote;
+
+    public async Task StartAsync(CancellationToken cancellationToken)
+    {
+        if (!_config.Enabled || !_config.IsCoordinator)
+            return;
+        _healthLoop = Task.Run(() => HealthLoopAsync(_cts.Token), CancellationToken.None);
+        await Task.CompletedTask;
+    }
+
+    public async Task StopAsync(CancellationToken cancellationToken)
+    {
+        await _cts.CancelAsync().ConfigureAwait(false);
+        if (_healthLoop is null)
+            return;
+        try
+        {
+            await _healthLoop.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    public ClusterHealthInfo BuildHealth()
+    {
+        List<ClusterScheduleSnapshot> active = [];
+        ClusterLastJobHealth? last;
+        lock (_publish)
+        {
+            foreach (ClusterJob job in _jobs.Values)
+                active.Add(job.Scheduler.Snapshot());
+            last = _lastJob;
+        }
+
+        return _registry.BuildHealth(active, last);
+    }
+
+    public void PublishLastJobHash(string jobId, string hash)
+    {
+        lock (_publish)
+        {
+            if (_lastJob is not null && _lastJob.JobId == jobId)
+                _lastJob.PageTextSha256 = hash;
+        }
+    }
+
+    public ClusterJob? FindJob(string jobId) =>
+        _jobs.TryGetValue(jobId, out ClusterJob? job) ? job : null;
+
+    public string? Register(ClusterRegisterRequest req)
+    {
+        string? warning = _registry.Register(req);
+        if (!string.IsNullOrWhiteSpace(warning))
+        {
+            _logger.LogWarning(
+                "Cluster node {NodeId} at {Url} does not match this node ({Warning}). Page text may differ across machines.",
+                req.NodeId,
+                req.BaseUrl,
+                warning);
+        }
+        else
+        {
+            _logger.LogInformation(
+                "Cluster node registered: {NodeId} url={Url} capacity={Capacity} mode={Mode} model={Model} dpi={Dpi}",
+                req.NodeId,
+                req.BaseUrl,
+                req.Capacity,
+                req.OcrMode,
+                req.Model,
+                req.Dpi);
+        }
+
+        if (req.Capacity > 0)
+        {
+            foreach (ClusterJob job in _jobs.Values)
+                job.Scheduler.SetCapacity(req.NodeId, req.Capacity);
+        }
+
+        return warning;
+    }
+
+    public void Heartbeat(ClusterHeartbeatRequest req)
+    {
+        _registry.Heartbeat(req);
+        if (req.Capacity > 0)
+        {
+            foreach (ClusterJob job in _jobs.Values)
+                job.Scheduler.SetCapacity(req.NodeId, req.Capacity);
+        }
+    }
+
+    public ClusterDispatchResponse Dispatch(string nodeId, int capacity, IReadOnlyList<string>? activeJobs)
+    {
+        if (capacity > 0 && !string.IsNullOrWhiteSpace(nodeId))
+        {
+            foreach (ClusterJob job in _jobs.Values)
+                job.Scheduler.SetCapacity(nodeId, capacity);
+        }
+
+        var busy = new HashSet<string>(StringComparer.Ordinal);
+        if (activeJobs is not null)
+        {
+            foreach (string id in activeJobs)
+            {
+                if (!string.IsNullOrWhiteSpace(id))
+                    busy.Add(id);
+            }
+        }
+
+        foreach (ClusterJob job in _jobs.Values.OrderBy(j => j.Started))
+        {
+            if (job.IsFinished)
+                continue;
+            if (string.IsNullOrWhiteSpace(nodeId))
+                continue;
+            if (busy.Contains(job.Id))
+                continue;
+            return new ClusterDispatchResponse
+            {
+                Wait = false,
+                JobId = job.Id,
+                Dpi = job.Dpi,
+                PageCount = job.PageCount,
+                PdfPath = "/cluster/jobs/" + job.Id + "/pdf",
+                RetryAfterMs = 200,
+            };
+        }
+
+        return new ClusterDispatchResponse { Wait = true, RetryAfterMs = 300 };
+    }
+
+    public bool Join(ClusterJob job, string nodeId, int capacity)
+    {
+        if (job.IsFinished || string.IsNullOrWhiteSpace(nodeId))
+            return false;
+        job.Joined[nodeId] = 1;
+        if (capacity > 0)
+            job.Scheduler.SetCapacity(nodeId, capacity);
+        _logger.LogInformation(
+            "Cluster job {JobId} node {NodeId} joined (capacity={Capacity})",
+            job.Id,
+            nodeId,
+            capacity);
+        return true;
+    }
+
+    public ClusterClaimResponse Claim(ClusterJob job, string nodeId, int maxPages)
+    {
+        if (job.IsFinished)
+            return new ClusterClaimResponse { Done = true };
+
+        if (maxPages <= 0)
+            maxPages = 1;
+        if (!string.IsNullOrWhiteSpace(nodeId))
+            job.Scheduler.SetCapacity(nodeId, Math.Max(1, maxPages));
+
+        ClusterClaim claim = job.Scheduler.Claim(nodeId, maxPages, DateTimeOffset.UtcNow);
+        if (claim.Kind == ClusterClaimKind.Batch)
+        {
+            _logger.LogInformation(
+                "Cluster job {JobId} claim node={Node} batch={Batch} pages={Pages} speculative={Spec} leaseMs={Lease}",
+                job.Id,
+                nodeId,
+                claim.BatchId,
+                string.Join(",", claim.Pages),
+                claim.Speculative,
+                claim.LeaseMs);
+        }
+
+        return new ClusterClaimResponse
+        {
+            Done = claim.Kind == ClusterClaimKind.Done,
+            Wait = claim.Kind == ClusterClaimKind.Wait,
+            BatchId = claim.Kind == ClusterClaimKind.Batch ? claim.BatchId : null,
+            Pages = claim.Kind == ClusterClaimKind.Batch ? claim.Pages.ToList() : null,
+            LeaseMs = claim.LeaseMs,
+            RetryAfterMs = claim.RetryAfterMs,
+            Speculative = claim.Speculative,
+        };
+    }
+
+    public int AcceptResults(ClusterJob job, string batchId, IReadOnlyList<OcrPageResult>? pages)
+    {
+        if (pages is null || pages.Count == 0)
+            return 0;
+        int accepted = 0;
+        foreach (OcrPageResult page in pages)
+        {
+            if (job.TryAccept(batchId, page))
+                accepted++;
+        }
+
+        return accepted;
+    }
+
+    public void FailBatch(ClusterJob job, string nodeId, string batchId, string? error)
+    {
+        int[] released = job.Scheduler.ReleaseBatch(batchId);
+        if (released.Length == 0)
+            return;
+        _logger.LogWarning(
+            "Cluster job {JobId} requeued pages [{Pages}] from node {Node} batch {Batch}: {Error}",
+            job.Id,
+            string.Join(",", released),
+            nodeId,
+            batchId,
+            string.IsNullOrWhiteSpace(error) ? "failed" : error);
+    }
+
+    public async Task<string> RunJobAsync(
+        byte[] pdf,
+        int pdfLength,
+        int pageCount,
+        int dpi,
+        Func<int[], string, ClusterJob, CancellationToken, Task> recognizeLocal,
+        Action<OcrPageResult> onAccepted,
+        CancellationToken ct)
+    {
+        string id = Guid.NewGuid().ToString("N");
+        List<ClusterRemote> remotes = _registry.Remotes();
+        var scheduler = new ClusterPageScheduler(new ClusterScheduleOptions
+        {
+            PageCount = pageCount,
+            LocalNodeId = _config.NodeId,
+            PagesPerBatch = _config.PagesPerBatch,
+            LeaseFloorMs = _config.LeaseFloorMs,
+            PageTimeoutMs = _config.PageTimeoutMs,
+            LeaseCapMs = Math.Max(_config.LeaseFloorMs, 180_000),
+            SpeculativeTailPages = _config.SpeculativeTailPages,
+            ExpectedNodes = Math.Max(1, 1 + remotes.Count),
+        });
+
+        int localCap = Math.Max(1, _registry.LocalCapacity);
+        scheduler.SetCapacity(_config.NodeId, localCap);
+        foreach (ClusterRemote remote in remotes)
+            scheduler.SetCapacity(remote.NodeId, Math.Max(1, remote.Capacity));
+
+        bool expectRemote = remotes.Count > 0;
+        scheduler.SetHoldLocalWindow(expectRemote && _config.JoinGraceMs > 0);
+
+        var job = new ClusterJob(id, scheduler, pdf, pdfLength, pageCount, dpi);
+        job.SetAccepted(onAccepted);
+        _jobs[id] = job;
+
+        WarnModelMismatch(remotes, dpi);
+        _logger.LogInformation(
+            "Cluster job {JobId} start: pages={Pages}, pdfBytes={Bytes}, dpi={Dpi}, remotes={Remotes}, localCapacity={LocalCap}, transport=pdf-once+page-ranges",
+            id,
+            pageCount,
+            pdfLength,
+            dpi,
+            remotes.Count,
+            localCap);
+
+        using CancellationTokenSource linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        Task notify = NotifyWorkersAsync(job, remotes, linked.Token);
+        Task grace = HoldGraceAsync(job, expectRemote, linked.Token);
+        Task deadline = DeadlineAsync(job, linked.Token);
+
+        int localFailures = 0;
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                if (scheduler.IsComplete)
+                    break;
+
+                ClusterClaim claim = scheduler.Claim(_config.NodeId, localCap, DateTimeOffset.UtcNow);
+                if (claim.Kind == ClusterClaimKind.Done)
+                    break;
+                if (claim.Kind == ClusterClaimKind.Wait)
+                {
+                    await scheduler.WaitForChangeAsync(claim.Version, TimeSpan.FromSeconds(1), ct)
+                        .ConfigureAwait(false);
+                    continue;
+                }
+
+                _logger.LogInformation(
+                    "Cluster job {JobId} claim node={Node} batch={Batch} pages={Pages} speculative={Spec} leaseMs={Lease}",
+                    id,
+                    _config.NodeId,
+                    claim.BatchId,
+                    string.Join(",", claim.Pages),
+                    claim.Speculative,
+                    claim.LeaseMs);
+
+                try
+                {
+                    await recognizeLocal(claim.Pages, claim.BatchId, job, ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    scheduler.ReleaseBatch(claim.BatchId);
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    int[] released = scheduler.ReleaseBatch(claim.BatchId);
+                    localFailures++;
+                    _logger.LogWarning(
+                        ex,
+                        "Cluster job {JobId} local batch {Batch} failed ({Failures}); requeued [{Pages}]",
+                        id,
+                        claim.BatchId,
+                        localFailures,
+                        string.Join(",", released));
+                    if (localFailures >= 3)
+                        throw;
+                    continue;
+                }
+
+                int[] leftover = scheduler.ReleaseBatch(claim.BatchId);
+                if (leftover.Length > 0)
+                {
+                    _logger.LogWarning(
+                        "Cluster job {JobId} local batch {Batch} incomplete; requeued [{Pages}]",
+                        id,
+                        claim.BatchId,
+                        string.Join(",", leftover));
+                }
+            }
+
+            ct.ThrowIfCancellationRequested();
+            job.DrainAccepts();
+            if (!scheduler.IsComplete)
+            {
+                throw new InvalidOperationException(
+                    $"Cluster job {id} ended with {scheduler.Snapshot().Done}/{pageCount} pages.");
+            }
+        }
+        finally
+        {
+            job.MarkFinished();
+            await linked.CancelAsync().ConfigureAwait(false);
+            await Quiet(notify).ConfigureAwait(false);
+            await Quiet(grace).ConfigureAwait(false);
+            await Quiet(deadline).ConfigureAwait(false);
+            job.StopNewPdfReads();
+            await job.WaitForPdfReadersAsync(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
+
+            ClusterScheduleSnapshot snap = scheduler.Snapshot();
+            var breakdown = new List<ClusterNodePages>();
+            foreach (ClusterNodeLoad load in snap.Nodes.OrderBy(n => n.NodeId, StringComparer.Ordinal))
+            {
+                if (load.PagesCommitted <= 0)
+                    continue;
+                breakdown.Add(new ClusterNodePages
+                {
+                    NodeId = load.NodeId,
+                    Pages = load.PagesCommitted,
+                });
+            }
+
+            double elapsed = (DateTimeOffset.UtcNow - job.Started).TotalMilliseconds;
+            string byNode = breakdown.Count == 0
+                ? "(none)"
+                : string.Join(", ", breakdown.Select(n => n.NodeId + "=" + n.Pages));
+            _logger.LogInformation(
+                "Cluster job {JobId} done: pages={Pages} elapsedMs={Elapsed:F0} byNode={ByNode}",
+                id,
+                pageCount,
+                elapsed,
+                byNode);
+
+            var last = new ClusterLastJobHealth
+            {
+                JobId = id,
+                PageCount = pageCount,
+                ElapsedMs = Math.Round(elapsed, 1),
+                Nodes = breakdown,
+            };
+
+            lock (_publish)
+            {
+                _registry.AddPages(snap.Nodes);
+                _jobs.TryRemove(id, out _);
+                _lastJob = last;
+            }
+        }
+
+        return id;
+    }
+
+    private void WarnModelMismatch(List<ClusterRemote> remotes, int jobDpi)
+    {
+        foreach (ClusterRemote remote in remotes)
+        {
+            if (!string.IsNullOrWhiteSpace(remote.Warning))
+            {
+                _logger.LogWarning(
+                    "Cluster node {NodeId} ({Url}) differs from coordinator ({Warning}). OCR text may not match single-node output.",
+                    remote.NodeId,
+                    remote.Url,
+                    remote.Warning);
+            }
+
+            if (remote.Dpi > 0 && remote.Dpi != jobDpi)
+            {
+                _logger.LogWarning(
+                    "Cluster node {NodeId} configured dpi={NodeDpi} differs from job dpi={JobDpi}. This job still renders at {JobDpi} on every node.",
+                    remote.NodeId,
+                    remote.Dpi,
+                    jobDpi,
+                    jobDpi);
+            }
+        }
+    }
+
+    private async Task HoldGraceAsync(ClusterJob job, bool expectRemote, CancellationToken ct)
+    {
+        if (!expectRemote || _config.JoinGraceMs <= 0)
+        {
+            job.Scheduler.SetHoldLocalWindow(false);
+            return;
+        }
+
+        try
+        {
+            await Task.Delay(_config.JoinGraceMs, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+
+        job.Scheduler.SetHoldLocalWindow(false);
+        _logger.LogInformation(
+            "Cluster job {JobId} join grace ({GraceMs}ms) elapsed; local node may take remaining pages",
+            job.Id,
+            _config.JoinGraceMs);
+    }
+
+    private async Task DeadlineAsync(ClusterJob job, CancellationToken ct)
+    {
+        try
+        {
+            await Task.Delay(_config.JobDeadlineMs, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+
+        _logger.LogWarning(
+            "Cluster job {JobId} hit deadline ({DeadlineMs}ms); dropping remote leases so the local node can finish",
+            job.Id,
+            _config.JobDeadlineMs);
+        job.Scheduler.TakeOverLocal(DateTimeOffset.UtcNow);
+    }
+
+    private async Task NotifyWorkersAsync(
+        ClusterJob job,
+        List<ClusterRemote> remotes,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(_config.AdvertiseUrl))
+        {
+            if (remotes.Count > 0)
+            {
+                _logger.LogWarning(
+                    "Cluster advertiseUrl is empty; static workers will not be notified. Workers that poll coordinatorUrl can still join job {JobId}.",
+                    job.Id);
+            }
+
+            return;
+        }
+
+        HttpClient http = _httpFactory.CreateClient(HttpClientName);
+        var body = new ClusterNotifyRequest
+        {
+            JobId = job.Id,
+            CoordinatorUrl = _config.AdvertiseUrl,
+            Dpi = job.Dpi,
+            PageCount = job.PageCount,
+        };
+
+        await Task.WhenAll(remotes.Select(remote => NotifyOneAsync(http, job, remote, body, ct)))
+            .ConfigureAwait(false);
+    }
+
+    private async Task NotifyOneAsync(
+        HttpClient http,
+        ClusterJob job,
+        ClusterRemote remote,
+        ClusterNotifyRequest body,
+        CancellationToken ct)
+    {
+        string url = remote.Url + "/cluster/notify";
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(TimeSpan.FromSeconds(5));
+            using var req = new HttpRequestMessage(HttpMethod.Post, url);
+            AddAuth(req);
+            req.Content = JsonContent.Create(body, AppJsonContext.Default.ClusterNotifyRequest);
+            using HttpResponseMessage resp = await http.SendAsync(req, timeout.Token).ConfigureAwait(false);
+            if (!resp.IsSuccessStatusCode)
+            {
+                _logger.LogWarning(
+                    "Cluster notify {Url} for job {JobId} returned {Status}. The worker can still poll.",
+                    url,
+                    job.Id,
+                    (int)resp.StatusCode);
+            }
+        }
+        catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException or TaskCanceledException)
+        {
+            _logger.LogWarning(
+                ex,
+                "Cluster notify {Url} for job {JobId} failed. The worker can still poll coordinatorUrl.",
+                url,
+                job.Id);
+        }
+    }
+
+    private async Task HealthLoopAsync(CancellationToken ct)
+    {
+        using PeriodicTimer timer = new(TimeSpan.FromMilliseconds(_config.HealthIntervalMs));
+        try
+        {
+            while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
+            {
+                await ProbeOnceAsync(ct).ConfigureAwait(false);
+                DateTimeOffset now = DateTimeOffset.UtcNow;
+                foreach (ClusterJob job in _jobs.Values)
+                    job.Scheduler.Reap(now);
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+        }
+    }
+
+    private async Task ProbeOnceAsync(CancellationToken ct)
+    {
+        List<ClusterRemote> remotes = _registry.Remotes();
+        if (remotes.Count == 0)
+            return;
+        HttpClient http = _httpFactory.CreateClient(HttpClientName);
+        foreach (ClusterRemote remote in remotes)
+        {
+            ClusterInfoResponse? info = null;
+            bool ok = false;
+            try
+            {
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                timeout.CancelAfter(TimeSpan.FromSeconds(3));
+                using var req = new HttpRequestMessage(HttpMethod.Get, remote.Url + "/cluster/info");
+                AddAuth(req);
+                using HttpResponseMessage resp = await http.SendAsync(req, timeout.Token).ConfigureAwait(false);
+                if (resp.IsSuccessStatusCode)
+                {
+                    await using Stream stream = await resp.Content.ReadAsStreamAsync(timeout.Token)
+                        .ConfigureAwait(false);
+                    info = await JsonSerializer.DeserializeAsync(stream, AppJsonContext.Default.ClusterInfoResponse, timeout.Token)
+                        .ConfigureAwait(false);
+                    ok = info is not null;
+                }
+            }
+            catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException or TaskCanceledException or JsonException)
+            {
+                ok = false;
+            }
+
+            bool becameUnhealthy = _registry.NoteProbe(remote.NodeId, ok, info);
+            if (!becameUnhealthy)
+                continue;
+
+            _logger.LogWarning(
+                "Cluster node {NodeId} at {Url} is unhealthy; its leased pages will be retried elsewhere",
+                remote.NodeId,
+                remote.Url);
+            foreach (ClusterJob job in _jobs.Values)
+                job.Scheduler.DropNode(remote.NodeId, DateTimeOffset.UtcNow);
+        }
+    }
+
+    private void AddAuth(HttpRequestMessage req)
+    {
+        req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _config.Token);
+    }
+
+    private static async Task Quiet(Task task)
+    {
+        try
+        {
+            await task.ConfigureAwait(false);
+        }
+        catch
+        {
+        }
+    }
+}

@@ -15,6 +15,7 @@ public sealed class PdfOcrPipeline
     private readonly LlmEntityExtractor? _llm;
     private readonly LlmVisionOcr? _vision;
     private readonly OcrRuntimeConfig _config;
+    private readonly ClusterCoordinator? _cluster;
     private readonly int _pageWindow;
     private readonly int _defaultDpi;
     private readonly int _rasterWorkers;
@@ -25,7 +26,8 @@ public sealed class PdfOcrPipeline
         OcrEngine? engine = null,
         LlmEntityExtractor? llm = null,
         LlmVisionOcr? vision = null,
-        WeChatOcrEngine? wechat = null)
+        WeChatOcrEngine? wechat = null,
+        ClusterCoordinator? cluster = null)
     {
         _config = config;
         _logger = logger;
@@ -33,6 +35,7 @@ public sealed class PdfOcrPipeline
         _wechat = wechat;
         _llm = llm;
         _vision = vision;
+        _cluster = cluster;
         _defaultDpi = config.DefaultDpi;
         _rasterWorkers = config.RasterWorkerCount;
 
@@ -89,6 +92,17 @@ public sealed class PdfOcrPipeline
             throw new InvalidOperationException($"PDF has {pageCount} pages; max supported is 2000.");
 
         int dpi = Math.Clamp(dpiOverride ?? _defaultDpi, 36, 300);
+
+        // No cluster config (or no remote nodes) keeps the single-node path below unchanged.
+        if (_cluster?.ShouldDistribute() == true)
+        {
+            _logger.LogInformation(
+                "OCR pipeline (cluster): {Pages} pages, {Bytes} bytes PDF, dpi={Dpi}, mode={Mode}",
+                pageCount, pdfByteCount, dpi, _config.Mode);
+            return await ProcessDistributedAsync(
+                pdfBytes, pdfByteCount, pageCount, dpi, downloadMs, downloadMode, totalSw, ct)
+                .ConfigureAwait(false);
+        }
 
         if (_config.IsLlmMode)
         {
@@ -284,6 +298,7 @@ public sealed class PdfOcrPipeline
             firstVisionFlag == 1,
             totalSw.Elapsed.TotalMilliseconds);
 
+        LogTextHash(pages);
         return new OcrResponse
         {
             Ok = true,
@@ -461,6 +476,7 @@ public sealed class PdfOcrPipeline
         List<OcrPageResult> visible = VisiblePages(pages);
 
         totalSw.Stop();
+        LogTextHash(pages);
 
         if (string.Equals(modeLabel, "wechat", StringComparison.Ordinal))
         {
@@ -503,6 +519,382 @@ public sealed class PdfOcrPipeline
             Pages = visible,
             Entities = entities,
         };
+    }
+
+    /// <summary>
+    /// Coordinator path. Remote nodes pull the PDF and page batches; this process is the
+    /// local node. NER still sees pages through <see cref="LlmEntityExtractor.LlmExtractionSession.Add"/>
+    /// as soon as each page is committed, in document order inside the grouper.
+    /// </summary>
+    private async Task<OcrResponse> ProcessDistributedAsync(
+        byte[] pdfBytes,
+        int pdfByteCount,
+        int pageCount,
+        int dpi,
+        double downloadMs,
+        string downloadMode,
+        Stopwatch totalSw,
+        CancellationToken ct)
+    {
+        bool vision = _config.IsLlmMode;
+        using CancellationTokenSource llmCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        LlmEntityExtractor.LlmExtractionSession? ner = !vision && _llm is { IsUsable: true }
+            ? _llm.Begin(pageCount, llmCts.Token)
+            : null;
+
+        OcrPageResult[] pages = new OcrPageResult[pageCount];
+        double rasterTotal = 0;
+        double ocrTotal = 0;
+        object timingLock = new();
+
+        void Accept(OcrPageResult page)
+        {
+            if (!vision)
+                page.RuleList = null;
+            int index = page.Page - 1;
+            if ((uint)index >= (uint)pageCount)
+                return;
+            pages[index] = page;
+            lock (timingLock)
+            {
+                rasterTotal += page.RasterizeMs;
+                ocrTotal += page.OcrMs;
+            }
+
+            if (!vision)
+                ner?.Add(page);
+        }
+
+        string jobId;
+        try
+        {
+            jobId = await _cluster!.RunJobAsync(
+                pdfBytes,
+                pdfByteCount,
+                pageCount,
+                dpi,
+                async (oneBased, batchId, job, token) =>
+                {
+                    int[] zeroBased = new int[oneBased.Length];
+                    for (int i = 0; i < oneBased.Length; i++)
+                        zeroBased[i] = oneBased[i] - 1;
+                    await RecognizeIndicesAsync(
+                        pdfBytes,
+                        pdfByteCount,
+                        zeroBased,
+                        dpi,
+                        page => job.TryAccept(batchId, page),
+                        token).ConfigureAwait(false);
+                },
+                Accept,
+                ct).ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            llmCts.Cancel();
+            if (ner is not null)
+                await ner.AbandonAsync().ConfigureAwait(false);
+            throw;
+        }
+
+        for (int i = 0; i < pageCount; i++)
+        {
+            if (pages[i] is null)
+            {
+                llmCts.Cancel();
+                if (ner is not null)
+                    await ner.AbandonAsync().ConfigureAwait(false);
+                throw new InvalidOperationException($"Missing OCR result for page {i + 1}.");
+            }
+        }
+
+        string hash = LogTextHash(pages);
+        _cluster.PublishLastJobHash(jobId, hash);
+        OcrEntities entities = vision
+            ? EntitiesFromVisionPages(pages)
+            : await ExtractEntitiesAsync(pages, ner).ConfigureAwait(false);
+        List<OcrPageResult> visible = VisiblePages(pages);
+        totalSw.Stop();
+
+        return new OcrResponse
+        {
+            Ok = true,
+            PageCount = pageCount,
+            PdfBytes = pdfByteCount,
+            DownloadMode = downloadMode,
+            Dpi = dpi,
+            Timings = new OcrTimings
+            {
+                DownloadMs = Math.Round(downloadMs, 1),
+                RasterizeMs = Math.Round(rasterTotal, 1),
+                OcrMs = Math.Round(ocrTotal, 1),
+                TotalMs = Math.Round(totalSw.Elapsed.TotalMilliseconds, 1),
+            },
+            Pages = visible,
+            Entities = entities,
+        };
+    }
+
+    /// <summary>
+    /// Raster + OCR a specific set of 0-based page indices. Used by cluster workers and
+    /// by the coordinator's local share. Does not run NER and does not distribute further.
+    /// </summary>
+    public async Task RecognizeIndicesAsync(
+        byte[] pdfBytes,
+        int pdfLength,
+        IReadOnlyList<int> pageIndices,
+        int dpi,
+        Action<OcrPageResult> onPage,
+        CancellationToken ct)
+    {
+        if (pageIndices.Count == 0)
+            return;
+        dpi = Math.Clamp(dpi, 36, 300);
+        if (_config.IsLlmMode)
+        {
+            await RecognizeIndicesVisionAsync(pdfBytes, pdfLength, pageIndices, dpi, onPage, ct)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        int workers;
+        Func<SKBitmap, CancellationToken, Task<string>> recognize;
+        if (_config.IsWeChatMode)
+        {
+            if (_wechat is null || !_wechat.IsReady)
+                throw new InvalidOperationException("ocr.mode=wechat requires a connected WeChat OCR engine.");
+            workers = Math.Max(1, _wechat.InstanceCount);
+            recognize = (bitmap, token) => _wechat.RecognizeBitmapAsync(bitmap, token);
+        }
+        else
+        {
+            if (_engine is null)
+                throw new InvalidOperationException("ocr.mode=local requires OcrEngine.");
+            workers = Math.Max(1, _engine.EngineCount);
+            recognize = RecognizeLocalAsync;
+        }
+
+        RenderOptions renderOptions = CreateRenderOptions(dpi);
+        int[] indices = pageIndices as int[] ?? pageIndices.ToArray();
+        Channel<(int Index, SKBitmap Bitmap, double RasterMs)> rasterized =
+            Channel.CreateBounded<(int, SKBitmap, double)>(new BoundedChannelOptions(Math.Max(4, workers * 2))
+            {
+                SingleWriter = false,
+                SingleReader = false,
+                FullMode = BoundedChannelFullMode.Wait,
+            });
+
+        Task producer = ProduceIndicesAsync(pdfBytes, pdfLength, indices, renderOptions, rasterized.Writer, ct);
+
+        async Task ConsumerAsync()
+        {
+            await foreach (var (index, bitmap, rasterMs) in rasterized.Reader.ReadAllAsync(ct).ConfigureAwait(false))
+            {
+                using (bitmap)
+                {
+                    Stopwatch ocrSw = Stopwatch.StartNew();
+                    int width = bitmap.Width;
+                    int height = bitmap.Height;
+                    string pageText = await recognize(bitmap, ct).ConfigureAwait(false);
+                    ocrSw.Stop();
+                    pageText = pageText.Replace("\r", "").Trim();
+                    onPage(new OcrPageResult
+                    {
+                        Page = index + 1,
+                        Width = width,
+                        Height = height,
+                        Text = pageText,
+                        RasterizeMs = Math.Round(rasterMs, 1),
+                        OcrMs = Math.Round(ocrSw.Elapsed.TotalMilliseconds, 1),
+                    });
+                }
+            }
+        }
+
+        int consumers = Math.Clamp(Math.Min(workers, Math.Max(1, indices.Length)), 1, workers);
+        Task[] tasks = new Task[consumers];
+        for (int i = 0; i < consumers; i++)
+            tasks[i] = ConsumerAsync();
+
+        Exception? failure = null;
+        try
+        {
+            await producer.ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            failure = ex;
+        }
+
+        try
+        {
+            await Task.WhenAll(tasks).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            failure ??= ex;
+        }
+
+        if (failure is not null)
+            throw failure;
+    }
+
+    private async Task RecognizeIndicesVisionAsync(
+        byte[] pdfBytes,
+        int pdfLength,
+        IReadOnlyList<int> pageIndices,
+        int dpi,
+        Action<OcrPageResult> onPage,
+        CancellationToken ct)
+    {
+        if (_vision is null || !_vision.IsUsable)
+            throw new InvalidOperationException("ocr.mode=llm requires a usable LLM.");
+
+        RenderOptions renderOptions = CreateRenderOptions(dpi);
+        int[] indices = pageIndices as int[] ?? pageIndices.ToArray();
+        int jpegQuality = _vision.OcrJpegQuality;
+        Channel<(int Index, SKBitmap Bitmap, double RasterMs)> rasterized =
+            Channel.CreateBounded<(int, SKBitmap, double)>(new BoundedChannelOptions(Math.Max(4, _pageWindow))
+            {
+                SingleWriter = false,
+                SingleReader = false,
+                FullMode = BoundedChannelFullMode.Wait,
+            });
+
+        Task producer = ProduceIndicesAsync(pdfBytes, pdfLength, indices, renderOptions, rasterized.Writer, ct);
+        int concurrency = Math.Clamp(Math.Min(_vision.OcrConcurrency, Math.Max(1, indices.Length)), 1, 64);
+
+        async Task ConsumerAsync()
+        {
+            await foreach (var (index, bitmap, rasterMs) in rasterized.Reader.ReadAllAsync(ct).ConfigureAwait(false))
+            {
+                using (bitmap)
+                {
+                    byte[] jpeg = LlmVisionOcr.EncodeJpeg(bitmap, jpegQuality);
+                    OcrPageResult page = await _vision
+                        .RecognizePageAsync(index + 1, bitmap.Width, bitmap.Height, jpeg, rasterMs, ct)
+                        .ConfigureAwait(false);
+                    onPage(page);
+                }
+            }
+        }
+
+        Task[] tasks = new Task[concurrency];
+        for (int i = 0; i < concurrency; i++)
+            tasks[i] = ConsumerAsync();
+        Exception? failure = null;
+        try
+        {
+            await producer.ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            failure = ex;
+        }
+
+        try
+        {
+            await Task.WhenAll(tasks).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            failure ??= ex;
+        }
+
+        if (failure is not null)
+            throw failure;
+    }
+
+    private async Task ProduceIndicesAsync(
+        byte[] pdfBytes,
+        int pdfLength,
+        int[] pageIndices,
+        RenderOptions renderOptions,
+        ChannelWriter<(int, SKBitmap, double)> writer,
+        CancellationToken ct)
+    {
+        int workers = Math.Clamp(Math.Min(_rasterWorkers, Math.Max(1, pageIndices.Length)), 1, 8);
+        try
+        {
+            Task[] tasks = new Task[workers];
+            for (int w = 0; w < workers; w++)
+            {
+                int workerId = w;
+                tasks[w] = Task.Run(async () =>
+                {
+                    using MemoryStream local = new(
+                        pdfBytes, index: 0, count: pdfLength, writable: false, publiclyVisible: true);
+                    List<int> mine = new((pageIndices.Length + workers - 1) / workers);
+                    for (int i = workerId; i < pageIndices.Length; i += workers)
+                        mine.Add(pageIndices[i]);
+                    if (mine.Count == 0)
+                        return;
+
+                    IEnumerator<SKBitmap> enumerator =
+                        Conversion.ToImages(local, mine, leaveOpen: true, options: renderOptions)
+                            .GetEnumerator();
+                    try
+                    {
+                        int idx = 0;
+                        while (idx < mine.Count)
+                        {
+                            ct.ThrowIfCancellationRequested();
+                            Stopwatch sw = Stopwatch.StartNew();
+                            if (!enumerator.MoveNext())
+                            {
+                                throw new InvalidOperationException(
+                                    $"PDFtoImage yielded {idx} pages, expected {mine.Count}.");
+                            }
+
+                            SKBitmap bitmap = enumerator.Current;
+                            sw.Stop();
+                            int pageIndex = mine[idx++];
+                            try
+                            {
+                                await writer.WriteAsync((pageIndex, bitmap, sw.Elapsed.TotalMilliseconds), ct)
+                                    .ConfigureAwait(false);
+                            }
+                            catch
+                            {
+                                bitmap.Dispose();
+                                while (enumerator.MoveNext())
+                                    enumerator.Current.Dispose();
+                                throw;
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        enumerator.Dispose();
+                    }
+                }, ct);
+            }
+
+            await Task.WhenAll(tasks).ConfigureAwait(false);
+        }
+        finally
+        {
+            writer.TryComplete();
+        }
+    }
+
+    private string LogTextHash(OcrPageResult?[] pages)
+    {
+        string hash = OcrTextHash.Compute(pages);
+        int nonempty = 0;
+        foreach (OcrPageResult? page in pages)
+        {
+            if (page is not null && ChallengeResultMapper.IncludeInOutput(page))
+                nonempty++;
+        }
+
+        _logger.LogInformation(
+            "OCR_TEXT_SHA256={Hash} pages={Pages} nonempty={NonEmpty}",
+            hash,
+            pages.Length,
+            nonempty);
+        Console.Out.Flush();
+        return hash;
     }
 
     private static List<OcrPageResult> VisiblePages(OcrPageResult[] pages)

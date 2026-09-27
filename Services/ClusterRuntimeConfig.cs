@@ -1,0 +1,192 @@
+using MiniOcr.Models;
+
+namespace MiniOcr.Services;
+
+/// <summary>
+/// Resolved <c>cluster</c> settings. Env <c>MINIOCR_CLUSTER_*</c> overrides the file.
+/// Clustering stays off when the section is missing, <c>enabled</c> is false, or the token is empty.
+/// </summary>
+public sealed class ClusterRuntimeConfig
+{
+    public const string LocalModelName = "ChineseV6Tiny";
+
+    public bool Enabled { get; init; }
+    /// <summary><c>coordinator</c>, <c>worker</c>, or <c>both</c>.</summary>
+    public string Role { get; init; } = "coordinator";
+    public string NodeId { get; init; } = "";
+    public string AdvertiseUrl { get; init; } = "";
+    public string Token { get; init; } = "";
+    public string CoordinatorUrl { get; init; } = "";
+    public int Capacity { get; init; }
+    public int PagesPerBatch { get; init; }
+    public int LeaseFloorMs { get; init; } = 20_000;
+    public int PageTimeoutMs { get; init; } = 20_000;
+    public int HealthIntervalMs { get; init; } = 5_000;
+    public int JobDeadlineMs { get; init; } = 300_000;
+    public int JoinGraceMs { get; init; } = 500;
+    public int SpeculativeTailPages { get; init; } = 4;
+    public IReadOnlyList<ClusterWorkerEndpoint> Workers { get; init; } = [];
+    /// <summary>Set when a request to enable clustering was ignored (empty token).</summary>
+    public string? DisabledReason { get; init; }
+
+    public bool IsCoordinator =>
+        string.Equals(Role, "coordinator", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(Role, "both", StringComparison.OrdinalIgnoreCase);
+
+    public bool IsWorker =>
+        string.Equals(Role, "worker", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(Role, "both", StringComparison.OrdinalIgnoreCase);
+
+    public static ClusterRuntimeConfig Resolve(AppConfigFile? file, Func<string, string?>? env = null)
+    {
+        env ??= Environment.GetEnvironmentVariable;
+        ClusterFileConfig section = file?.Cluster ?? new ClusterFileConfig();
+
+        bool enabled = section.Enabled;
+        string? envEnabled = env("MINIOCR_CLUSTER_ENABLED");
+        if (!string.IsNullOrWhiteSpace(envEnabled))
+            enabled = ParseBool(envEnabled, enabled);
+
+        string role = FirstNonEmpty(env("MINIOCR_CLUSTER_ROLE"), section.Role) ?? "coordinator";
+        role = role.Trim().ToLowerInvariant();
+        if (role is not ("coordinator" or "worker" or "both"))
+            role = "coordinator";
+
+        string token = FirstNonEmpty(env("MINIOCR_CLUSTER_TOKEN"), section.Token) ?? "";
+        token = token.Trim();
+
+        string? disabledReason = null;
+        if (enabled && token.Length == 0)
+        {
+            enabled = false;
+            disabledReason = "cluster.enabled is true but token is empty; clustering left off";
+        }
+
+        string nodeId = FirstNonEmpty(env("MINIOCR_CLUSTER_NODE_ID"), section.NodeId) ?? "";
+        nodeId = nodeId.Trim();
+        if (enabled && nodeId.Length == 0)
+        {
+            string host = Environment.MachineName;
+            if (string.IsNullOrWhiteSpace(host))
+                host = "node";
+            nodeId = host + "-" + role + "-" + Guid.NewGuid().ToString("N")[..8];
+        }
+
+        string? advertise = TrimUrl(FirstNonEmpty(env("MINIOCR_CLUSTER_ADVERTISE_URL"), section.AdvertiseUrl));
+        string? coordinator = TrimUrl(FirstNonEmpty(env("MINIOCR_CLUSTER_COORDINATOR_URL"), section.CoordinatorUrl));
+
+        int capacity = ReadInt(env, "MINIOCR_CLUSTER_CAPACITY", section.Capacity ?? 0);
+        if (capacity < 0)
+            capacity = 0;
+
+        int pagesPerBatch = ReadInt(env, "MINIOCR_CLUSTER_PAGES_PER_BATCH", section.PagesPerBatch ?? 0);
+        pagesPerBatch = pagesPerBatch <= 0 ? 0 : Math.Clamp(pagesPerBatch, 1, 64);
+
+        int leaseSeconds = Math.Clamp(
+            ReadInt(env, "MINIOCR_CLUSTER_LEASE_SECONDS", section.LeaseSeconds <= 0 ? 20 : section.LeaseSeconds),
+            1, 600);
+        int pageTimeout = Math.Clamp(
+            ReadInt(env, "MINIOCR_CLUSTER_PAGE_TIMEOUT_SECONDS", section.PageTimeoutSeconds <= 0 ? 20 : section.PageTimeoutSeconds),
+            1, 600);
+        int healthSeconds = Math.Clamp(
+            ReadInt(env, "MINIOCR_CLUSTER_HEALTH_INTERVAL_SECONDS", section.HealthIntervalSeconds <= 0 ? 5 : section.HealthIntervalSeconds),
+            1, 120);
+        int deadlineSeconds = Math.Clamp(
+            ReadInt(env, "MINIOCR_CLUSTER_JOB_DEADLINE_SECONDS", section.JobDeadlineSeconds <= 0 ? 300 : section.JobDeadlineSeconds),
+            5, 3600);
+        int joinGrace = Math.Clamp(
+            ReadInt(env, "MINIOCR_CLUSTER_JOIN_GRACE_MS", section.JoinGraceMs <= 0 ? 500 : section.JoinGraceMs),
+            0, 60_000);
+        int tail = Math.Clamp(
+            ReadInt(env, "MINIOCR_CLUSTER_SPECULATIVE_TAIL", section.SpeculativeTailPages <= 0 ? 4 : section.SpeculativeTailPages),
+            1, 64);
+
+        List<ClusterWorkerEndpoint> workers = [];
+        string? envWorkers = env("MINIOCR_CLUSTER_WORKERS");
+        if (!string.IsNullOrWhiteSpace(envWorkers))
+        {
+            foreach (string part in envWorkers.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                string url = TrimUrl(part) ?? "";
+                if (url.Length > 0)
+                    workers.Add(new ClusterWorkerEndpoint(url, 0));
+            }
+        }
+        else if (section.Workers is not null)
+        {
+            foreach (ClusterWorkerFileConfig w in section.Workers)
+            {
+                string url = TrimUrl(w.Url) ?? "";
+                if (url.Length == 0)
+                    continue;
+                int cap = w.Capacity ?? 0;
+                workers.Add(new ClusterWorkerEndpoint(url, Math.Max(0, cap)));
+            }
+        }
+
+        return new ClusterRuntimeConfig
+        {
+            Enabled = enabled,
+            Role = role,
+            NodeId = nodeId,
+            AdvertiseUrl = advertise ?? "",
+            Token = token,
+            CoordinatorUrl = coordinator ?? "",
+            Capacity = capacity,
+            PagesPerBatch = pagesPerBatch,
+            LeaseFloorMs = leaseSeconds * 1000,
+            PageTimeoutMs = pageTimeout * 1000,
+            HealthIntervalMs = healthSeconds * 1000,
+            JobDeadlineMs = deadlineSeconds * 1000,
+            JoinGraceMs = joinGrace,
+            SpeculativeTailPages = tail,
+            Workers = workers,
+            DisabledReason = disabledReason,
+        };
+    }
+
+    public int EffectiveCapacity(int engineCount, int visionConcurrency, bool llmMode)
+    {
+        if (Capacity > 0)
+            return Math.Clamp(Capacity, 1, 64);
+        if (llmMode)
+            return Math.Clamp(Math.Max(1, visionConcurrency), 1, 64);
+        return Math.Clamp(Math.Max(1, engineCount), 1, 64);
+    }
+
+    private static int ReadInt(Func<string, string?> env, string name, int fallback)
+    {
+        string? raw = env(name);
+        return int.TryParse(raw, out int v) ? v : fallback;
+    }
+
+    private static bool ParseBool(string raw, bool fallback)
+    {
+        string s = raw.Trim();
+        if (bool.TryParse(s, out bool b))
+            return b;
+        if (s is "1" or "yes" or "YES" or "on" or "ON")
+            return true;
+        if (s is "0" or "no" or "NO" or "off" or "OFF")
+            return false;
+        return fallback;
+    }
+
+    private static string? FirstNonEmpty(string? a, string? b)
+    {
+        if (!string.IsNullOrWhiteSpace(a))
+            return a.Trim();
+        if (!string.IsNullOrWhiteSpace(b))
+            return b.Trim();
+        return null;
+    }
+
+    private static string? TrimUrl(string? url)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+            return null;
+        return url.Trim().TrimEnd('/');
+    }
+}
+
+public sealed record ClusterWorkerEndpoint(string Url, int Capacity);

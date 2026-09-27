@@ -46,6 +46,7 @@ string configPath = configLoad.ConfigPath;
 bool configFileExisted = configLoad.ConfigFileExisted;
 LlmRuntimeConfig llmConfig = AppConfigStore.ResolveLlm(appConfig);
 OcrRuntimeConfig runtimeConfig = OcrRuntimeConfig.FromAppConfig(appConfig);
+ClusterRuntimeConfig clusterConfig = ClusterRuntimeConfig.Resolve(appConfig);
 
 if (OcrCompareRunner.IsRequested(args))
 {
@@ -201,6 +202,65 @@ builder.Services.AddSingleton<LlmVisionOcr>(sp =>
         sp.GetRequiredService<ILogger<LlmVisionOcr>>());
 });
 
+if (clusterConfig.Enabled)
+{
+    int localSlots = runtimeConfig.IsWeChatMode
+        ? Math.Max(1, wechatEngine?.InstanceCount ?? runtimeConfig.WeChatInstances)
+        : (engine?.EngineCount ?? runtimeConfig.EngineCount);
+    int clusterCapacity = clusterConfig.EffectiveCapacity(
+        localSlots,
+        llmConfig.OcrConcurrency,
+        runtimeConfig.IsLlmMode);
+    string clusterModel = runtimeConfig.IsLlmMode
+        ? llmConfig.Model
+        : runtimeConfig.IsWeChatMode
+            ? "wechat-" + (wechatEngine?.KindName ?? "plugin")
+            : ClusterRuntimeConfig.LocalModelName;
+    var clusterSelf = new ClusterSelf
+    {
+        NodeId = clusterConfig.NodeId,
+        Role = clusterConfig.Role,
+        Capacity = clusterCapacity,
+        EngineCount = engine?.EngineCount ?? (runtimeConfig.IsWeChatMode ? localSlots : 0),
+        OcrMode = runtimeConfig.Mode,
+        Model = clusterModel,
+        Dpi = runtimeConfig.DefaultDpi,
+        AdvertiseUrl = clusterConfig.AdvertiseUrl,
+    };
+    builder.Services.AddSingleton(clusterConfig);
+    builder.Services.AddSingleton(clusterSelf);
+    builder.Services.AddSingleton(sp =>
+    {
+        var registry = new ClusterNodeRegistry(
+            clusterSelf,
+            Math.Max(3_000, clusterConfig.HealthIntervalMs * 3));
+        if (clusterConfig.IsCoordinator)
+        {
+            foreach (ClusterWorkerEndpoint worker in clusterConfig.Workers)
+                registry.SeedWorker(worker.Url, worker.Capacity);
+        }
+
+        return registry;
+    });
+    builder.Services.AddHttpClient(ClusterCoordinator.HttpClientName, client =>
+    {
+        client.Timeout = TimeSpan.FromMinutes(10);
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("MiniOcr/1.0 (+cluster)");
+    });
+    builder.Services.AddSingleton<ClusterCoordinator>();
+    Console.WriteLine(
+        $"Cluster: enabled role={clusterConfig.Role} nodeId={clusterConfig.NodeId} " +
+        $"capacity={clusterCapacity} model={clusterModel} dpi={runtimeConfig.DefaultDpi} " +
+        $"workers={clusterConfig.Workers.Count} advertise={clusterConfig.AdvertiseUrl} " +
+        $"coordinator={clusterConfig.CoordinatorUrl} token=(set)");
+}
+else
+{
+    Console.WriteLine(clusterConfig.DisabledReason is { Length: > 0 }
+        ? "Cluster: off (" + clusterConfig.DisabledReason + ")"
+        : "Cluster: off");
+}
+
 builder.Services.AddSingleton<PdfOcrPipeline>(sp =>
 {
     OcrRuntimeConfig cfg = sp.GetRequiredService<OcrRuntimeConfig>();
@@ -210,12 +270,22 @@ builder.Services.AddSingleton<PdfOcrPipeline>(sp =>
         engine: sp.GetService<OcrEngine>(),
         llm: sp.GetService<LlmEntityExtractor>(),
         vision: sp.GetService<LlmVisionOcr>(),
-        wechat: sp.GetService<WeChatOcrEngine>());
+        wechat: sp.GetService<WeChatOcrEngine>(),
+        cluster: sp.GetService<ClusterCoordinator>());
 });
+if (clusterConfig.Enabled)
+{
+    builder.Services.AddSingleton<ClusterWorkerHost>();
+    builder.Services.AddHostedService(sp => sp.GetRequiredService<ClusterCoordinator>());
+    builder.Services.AddHostedService(sp => sp.GetRequiredService<ClusterWorkerHost>());
+}
+
 builder.Services.AddSingleton<ChallengeJobService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<ChallengeJobService>());
 
 WebApplication app = builder.Build();
+if (clusterConfig.Enabled)
+    ClusterEndpoints.Map(app);
 ILogger logger = app.Logger;
 
 IHostApplicationLifetime lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
@@ -264,6 +334,7 @@ app.MapGet("/health", (IServiceProvider sp) =>
             LlmBaseUrl = llm.BaseUrl,
             LlmFallbackToHeuristics = llm.FallbackToHeuristics,
             LlmApiKey = apiKeyStatus,
+            Cluster = BuildClusterHealth(sp),
         },
         AppJsonContext.Default.HealthResponse);
 });
@@ -702,7 +773,8 @@ app.MapGet("/", () => Results.Text(
     "Env CONFIG: MINIOCR_CONFIG_PATH\n" +
     "Env OCR: MINIOCR_OCR_MODE MINIOCR_ENGINES MINIOCR_DPI MINIOCR_LINE_WORKERS MINIOCR_DET_THREADS MINIOCR_USE_CLS MINIOCR_RASTER_WORKERS\n" +
     "Env WECHAT: MINIOCR_WECHAT_OCR_PATH MINIOCR_WECHAT_DIR MINIOCR_WECHAT_INSTANCES MINIOCR_WECHAT_FALLBACK\n" +
-    "Env LLM: MINIOCR_LLM_API_KEY MINIOCR_LLM_BASE_URL MINIOCR_LLM_MODEL MINIOCR_LLM_MAX_CONCURRENCY MINIOCR_LLM_PAGES_PER_REQUEST MINIOCR_LLM_OCR_CONCURRENCY MINIOCR_LLM_THINKING\n",
+    "Env LLM: MINIOCR_LLM_API_KEY MINIOCR_LLM_BASE_URL MINIOCR_LLM_MODEL MINIOCR_LLM_MAX_CONCURRENCY MINIOCR_LLM_PAGES_PER_REQUEST MINIOCR_LLM_OCR_CONCURRENCY MINIOCR_LLM_THINKING\n" +
+    "Env cluster: MINIOCR_CLUSTER_ENABLED MINIOCR_CLUSTER_ROLE MINIOCR_CLUSTER_TOKEN MINIOCR_CLUSTER_NODE_ID MINIOCR_CLUSTER_ADVERTISE_URL MINIOCR_CLUSTER_COORDINATOR_URL MINIOCR_CLUSTER_WORKERS MINIOCR_CLUSTER_CAPACITY\n",
     "text/plain; charset=utf-8"));
 
 string urls = string.Join(", ", app.Urls.DefaultIfEmpty("(default http://localhost:5000)"));
@@ -746,6 +818,18 @@ static IResult FinishDebug(int teamId, string? key, string fileId, OcrResponse o
         Result = [ChallengeResultMapper.BuildFileResult(fileId, ocr)],
     };
     return Results.Json(callbackShaped, AppJsonContext.Default.ChallengeCallbackBody);
+}
+
+ClusterHealthInfo? BuildClusterHealth(IServiceProvider sp)
+{
+    ClusterRuntimeConfig? cfg = sp.GetService<ClusterRuntimeConfig>();
+    if (cfg is not { Enabled: true })
+        return null;
+    if (cfg.IsCoordinator && sp.GetService<ClusterCoordinator>() is { } coordinator)
+        return coordinator.BuildHealth();
+    if (sp.GetService<ClusterWorkerHost>() is { } worker)
+        return worker.BuildHealth();
+    return null;
 }
 
 await app.RunAsync();

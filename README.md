@@ -10,6 +10,8 @@
 - **`llm`**：跳过本地 Paddle 模型加载；将每页 JPEG 以 `image_url` data URL 发给多模态 Chat Completions，一次调用尽量直接返回竞赛形状的 B04/B06 `ruleList`（可配高并发，I/O 密集）。
 - **`wechat`（实验，仅 Windows x64）**：调用本机微信自带 OCR 插件做对比。栅格、按 10 个非空页分组的 LLM NER、协议输出、丢掉空白页都与 `local` 相同。**不要**拿它当竞赛服务端：接口是非官方逆向，有 ToS 风险。详见下方「微信 OCR」。
 
+多机 OCR 默认**关闭**。打开 `cluster` 后，同一份二进制可以当协调节点和/或工人节点，把页级 OCR 拉到多台机器上（协调节点自己也算一台）。见下文「分布式 OCR」。
+
 ## 竞赛协议（serviceUrl）
 
 平台**无登录/无 token**调用本服务；填入竞赛后台的 **serviceUrl** 推荐：
@@ -605,9 +607,170 @@ The current CPU is missing one or more of the required instruction sets.
 | --- | --- | --- |
 | `POST` | `/challenge` | **竞赛 serviceUrl（推荐）**：异步受理，见上文「竞赛协议」 |
 | `POST` | `/` | 与 `/challenge` 相同（可将 serviceUrl 填根路径） |
-| `GET` | `/health` | 健康、模型与当前旋钮 |
+| `GET` | `/health` | 健康、模型与当前旋钮。`cluster.enabled` 时附带节点、容量、各节点已完成页数 |
 | `POST` | `/ocr` | 调试用同步 OCR：竞赛兼容 `files[{fileId,url}]`，响应同回调 `result` 形状（遗留 `{url,dpi?}` 仍可用） |
 | `GET` | `/` | 纯文本接口说明 |
+| `GET` | `/cluster/info` | 集群探活（需 token）：本节点 mode / model / dpi / capacity |
+| `POST` | `/cluster/register` `/cluster/heartbeat` `/cluster/dispatch` | 工人向协调节点注册、心跳、拉取任务（需 token） |
+| `GET` | `/cluster/jobs/{id}/pdf` | 工人下载该任务的 PDF 一次（需 token） |
+| `POST` | `/cluster/jobs/{id}/join` `/claim` `/result` `/fail` | 领取页批次、回传文本、失败重排队（需 token） |
+| `POST` | `/cluster/notify` | 协调节点通知工人有新任务（需 token；工人也可以只靠轮询） |
+
+`/challenge` 与 `/ocr` **不加**集群 token（竞赛平台无登录）。只有 `/cluster/*` 校验共享密钥。
+
+## 分布式 OCR（cluster）
+
+本地 OCR 是 CPU 活。协调节点把**页**分给多台机器（含它自己）。大文档上墙钟应随总核数下降；很短的文档会被领页和打开 PDF 的固定开销吃掉，见下面的实测。未配置 `cluster` 或 `enabled: false` 时，走原来的单机流水线，协议 JSON 不变。
+
+### 为什么传 PDF + 页码，而不是页图
+
+每个工人**下载一次 PDF**，再按页码批次自己栅格化。回传的只是每页文本（KB 级）。
+
+页图和 PDF 谁更大取决于文档。在开发机上用 PyMuPDF（栅格器和 PDFium 不同，只作数量级）把 `samples/sample-multipage.pdf`（558351 字节，5 页）按 96 DPI 灰度栅格：5 页 PNG 合计 290755 字节、JPEG q70 合计 199416 字节，分别是 PDF 的 0.52 和 0.36。第 1 页 794×1123，PNG 58207 字节、JPEG 40266 字节。这份样例上，压缩页图比整本 PDF 更小。
+
+仍然每个工人传一次 PDF、不传页图：
+
+- 协调节点若先替别人栅格并编码 PNG/JPEG，花的是本来要拿去 OCR 的 CPU，而且编码卡在每个批次的关键路径上。PDF 只下一次，和协调节点自己已经在跑的本地 OCR 重叠。
+- 工人拿到 PDF 后走现有的 `ToImages`（文档复用），栅格 CPU 留在即将 OCR 的机器上。
+- 竞赛目标大约 300 MB / 2000 页。按上面这种文本页 JPEG ~40 KB 估算，2000 页大约 80 MB；扫描页更大，约 150 KB/页时整本图和一份 300 MB 的 PDF 同级。无论谁更大，页图都要按批次反复上传；PDF 是每个工人一次传输。
+- 带宽因此是「工人数 × PDF 大小」一次，加上回传的小 JSON。
+
+工人用自己配置的 OCR 模式（默认还是 `local` / ChineseV6Tiny）。Windows 工人可以配 `wechat`，领到的页走本机微信插件；协调节点把这种模型记成 `wechat-<kind>`。任务 DPI 以协调节点本次请求为准，各节点按这个 DPI 渲染。若某节点的 **mode、模型名或配置 DPI** 与协调节点不一致，协调节点打 **warning**（文本可能对不齐），任务仍会继续。
+
+### 怎么分活
+
+拉模式，不是按页数切死：
+
+1. 协调节点创建任务，自己的引擎池是节点之一，立刻开始领页。
+2. 工人 `POST /cluster/dispatch` 轮询（或被 `POST /cluster/notify` 叫醒）后 `GET` PDF 一次，再 `POST /claim` 领下一批。
+3. 批次大小约等于该节点 `capacity`（默认本机引擎数；`llm` 模式用视觉并发），封顶 16，临近结尾缩到 1–2 页，避免尾巴粘在一台慢机器上。
+4. 一台机器同时在途的页数不超过它的 capacity，所以更快的机器更早来领下一批，自然多干。
+5. 短文档上协调节点会在 `joinGraceMs`（默认 500）内先把自己限制在一个窗口，给工人留出下载时间；大文档上这点时间可以忽略。过了宽限，本地节点继续把剩下的页吃完。
+6. 租约到期、`/fail`、或健康检查连续失败：这些页回到队列，别的节点（含本地）重做。投机执行：待处理队列空了且未完成页数 ≤ `speculativeTailPages`（默认 4）时，空闲节点会再跑一遍尾巴，谁先写回谁算数。
+7. 到达 `jobDeadlineSeconds`（默认 300）仍有远程租约：协调节点丢弃远程租约，剩下的页只在本地做完。死掉的工人不会让任务挂死或直接失败。
+8. 页按完成顺序写入，但 LLM NER 仍用原来的有序缓冲：凑满**连续的** 10 个非空页就发出一组，空白页不占名额、也不进协议输出。最终每页文本与单机相同（同一模型、同一 DPI）。
+
+`GET /health` 在集群开启时多一个 `cluster` 对象：节点、容量、健康、在途页、累计完成页。每个任务结束时日志有一行 `byNode=coord=.., worker-a=..`，以及 `OCR_TEXT_SHA256=`（全页文本哈希，含空白页，便于和单机对照）。这些都不进竞赛 JSON。
+
+### 这台开发机上的计时
+
+4 核 Linux。每个进程 `taskset` 绑 1 核、引擎数 1、96 DPI、每批 1 页。20 页是把样例 PDF 重复 4 次（561183 字节）。哈希是全部页文本（含空白页）的 SHA-256，和单机逐页文本一致。
+
+| 跑法 | 墙钟 | 提交页数 | 文本哈希 |
+| --- | --- | --- | --- |
+| 单机，5 页 | 2233 ms | — | `ebff69493a49e0ed8b01d52587c71ef3295abd8e326e718771f11c511f77e6d0` |
+| 单机，20 页 | 5203 ms | — | `0f89d18fbf7b5cc23f62d6348cbaedbec505e10c84f3339a250092e32d008f6a` |
+| 三节点，5 页 | 2190 ms | coord 3 / worker-a 1 / worker-b 1 | 与单机相同 |
+| 三节点，20 页，`joinGraceMs=20000`（`ClusterLive` 把协调节点按住） | 3960 ms | coord 1 / worker-a 10 / worker-b 9 | 与单机相同 |
+| 同上，中途杀掉 worker-b | 4851 ms | coord 1 / worker-a 19（worker-b 提交 0，页被重做） | 与单机相同 |
+
+另一次把 `joinGraceMs` 改成默认 500：20 页 4647 ms，提交页 coord 9 / worker-a 5 / worker-b 6，哈希仍是上面的 20 页值（那次单机 20 页是 5333 ms）。
+
+20 页、每批 1 页时，领页 HTTP 和每台打开 PDF 的固定开销还压得过 OCR，所以 3 个单核节点大约 1.15×（默认宽限）到 1.31×（协调节点让出），不是 3×。页数到几百、两千时，OCR 会盖过这些开销。`tests/MiniOcr.ClusterLive` 用 20 秒宽限，是为了让 5 页样例也能摊到工人上；默认 500 ms 适合大文档。
+
+### 配置
+
+同一份 `config.json` 的 `cluster` 段。环境变量 `MINIOCR_CLUSTER_*` 覆盖文件。`enabled` 但 `token` 为空时会记一条警告并**保持关闭**。
+
+协调节点（Windows 笔记本示例，监听所有网卡）：
+
+```json
+{
+  "ocr": { "mode": "local", "dpi": 96, "autoScaleFromCpu": true },
+  "cluster": {
+    "enabled": true,
+    "role": "coordinator",
+    "nodeId": "laptop",
+    "advertiseUrl": "http://192.168.1.20:5080",
+    "token": "replace-with-a-long-random-secret",
+    "capacity": 0,
+    "joinGraceMs": 500,
+    "leaseSeconds": 20,
+    "pageTimeoutSeconds": 20,
+    "healthIntervalSeconds": 5,
+    "jobDeadlineSeconds": 300,
+    "speculativeTailPages": 4,
+    "workers": [
+      { "url": "http://192.168.1.30:5081", "capacity": 0 }
+    ]
+  }
+}
+```
+
+工人节点（Mac）可以不写进上面的 `workers`，自己来注册：
+
+```json
+{
+  "ocr": { "mode": "local", "dpi": 96, "autoScaleFromCpu": true },
+  "cluster": {
+    "enabled": true,
+    "role": "worker",
+    "nodeId": "mac",
+    "advertiseUrl": "http://192.168.1.30:5081",
+    "coordinatorUrl": "http://192.168.1.20:5080",
+    "token": "replace-with-a-long-random-secret",
+    "capacity": 0
+  }
+}
+```
+
+`capacity: 0` 表示用本机引擎数。`workers[].capacity: 0` 表示等对方 `/cluster/info` 或注册报文里的容量。
+
+两边 DPI、`ocr.mode`、模型保持一致（都用默认 `local` + ChineseV6Tiny）。Mac 用 `osx-arm64` 包，Windows 用 `win-x64`（或 `win-x64-avx512v2`）包，Linux 工人用对应 RID。协议是 HTTP + JSON，不共享进程或原生库。
+
+启动：
+
+```bash
+# Windows（协调节点）
+MiniOcr.exe --urls http://0.0.0.0:5080
+
+# macOS（工人）
+./MiniOcr --urls http://0.0.0.0:5081
+```
+
+环境变量（覆盖文件，便于一台机器临时改角色）：
+
+| 变量 | 含义 |
+| --- | --- |
+| `MINIOCR_CLUSTER_ENABLED` | `1` / `true` 打开 |
+| `MINIOCR_CLUSTER_ROLE` | `coordinator`、`worker` 或 `both` |
+| `MINIOCR_CLUSTER_TOKEN` | 共享密钥 |
+| `MINIOCR_CLUSTER_NODE_ID` | 节点名 |
+| `MINIOCR_CLUSTER_ADVERTISE_URL` | 别的机器访问本进程的基址 |
+| `MINIOCR_CLUSTER_COORDINATOR_URL` | 工人要连的协调节点 |
+| `MINIOCR_CLUSTER_WORKERS` | 逗号分隔的工人 URL（仅协调节点） |
+| `MINIOCR_CLUSTER_CAPACITY` | 覆盖本机容量 |
+| `MINIOCR_CLUSTER_PAGES_PER_BATCH` | 固定批次大小（默认按容量自动） |
+| `MINIOCR_CLUSTER_LEASE_SECONDS` | 批次租约下限 |
+| `MINIOCR_CLUSTER_PAGE_TIMEOUT_SECONDS` | 每页额外租约 |
+| `MINIOCR_CLUSTER_HEALTH_INTERVAL_SECONDS` | 探活 / 心跳间隔 |
+| `MINIOCR_CLUSTER_JOB_DEADLINE_SECONDS` | 到点后本地接管剩余页 |
+| `MINIOCR_CLUSTER_JOIN_GRACE_MS` | 开局留给工人下载 PDF 的本地窗口 |
+| `MINIOCR_CLUSTER_SPECULATIVE_TAIL` | 尾巴投机复制的页数上限 |
+
+### 防火墙和端口
+
+流量是双向的，但**工人主动连协调节点**就够跑起来：
+
+- 协调节点入站：`advertiseUrl` 的 TCP 端口（注册、心跳、拉任务、下载 PDF、回传结果）。Windows 防火墙要放行这个端口；只对局域网开放，不要把没有 TLS 的端口暴露到公网（token 是共享密钥，不是用户体系）。
+- 工人出站：访问协调节点即可。家用路由器后面的笔记本 / Mac 通常不用做端口映射。
+- 协调节点到工人的 `POST /cluster/notify` 和 `GET /cluster/info` 是可选加速。工人入站被系统防火墙拦住时，通知会失败并记警告，工人改为轮询 `coordinatorUrl`，任务仍然完成。心跳新鲜时，探活失败**不会**把节点判死。
+- 竞赛 `serviceUrl` 只打到协调节点的 `/challenge`。工人不需要公网地址。
+- `advertiseUrl` 填局域网 IP，不要填 `127.0.0.1`（那只对同一台机器上的多进程测试有意义）。
+
+`role: both` 表示本进程既接 `/challenge` 并分发，也接受别的协调节点派来的页。不要把 `coordinatorUrl` 指回自己。
+
+调度与鉴权（不加载 OCR 模型）：
+
+```bash
+dotnet run -c Release --project tests/MiniOcr.ClusterSmoke
+```
+
+本机多进程（协调节点 + 两个工人，会真正跑 ChineseV6Tiny）：
+
+```bash
+dotnet run -c Release --project tests/MiniOcr.ClusterLive
+```
 
 ## 项目结构
 
@@ -623,15 +786,25 @@ miniocr/
   Services/
     AppConfigStore.cs     # config path resolution (AppData / Application Support / ~/.config)
     OcrRuntimeConfig.cs   # 文件+环境变量+CPU 自动扩缩
+    ClusterRuntimeConfig.cs
+    ClusterPageScheduler.cs  # 拉模式页队列、租约、尾巴投机
+    ClusterCoordinator.cs
+    ClusterWorkerHost.cs
+    ClusterEndpoints.cs
     LlmEntityExtractor.cs # OpenAI 兼容 Chat Completions NER
     ParallelPdfDownloader.cs
     RentedBuffer.cs
     OcrEngine.cs
+    WeChat/WeChatOcrEngine.cs  # 实验：Windows 微信插件（mmmojo）
+    OcrCompareRunner.cs   # MiniOcr --compare
     PdfOcrPipeline.cs
     EntityExtractor.cs    # 启发式回退
     ChallengeJobService.cs # 竞赛异步队列 + 回调
     ChallengeResultMapper.cs # 按页 B04/B06 + originText
-  tests/MiniOcr.EntitySmoke/  # 实体抽取冒烟
+  tests/MiniOcr.EntitySmoke/   # 实体抽取冒烟
+  tests/MiniOcr.WeChatSmoke/   # 微信 OCR 定位与 protobuf（不连微信）
+  tests/MiniOcr.ClusterSmoke/  # 调度器 / 配置 / 鉴权（不加载模型）
+  tests/MiniOcr.ClusterLive/   # 本机多进程：协调节点 + 2 工人
   samples/sample-multipage.pdf
   README.md
 ```

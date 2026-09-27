@@ -128,4 +128,7 @@ public sealed class HealthResponse
     public bool LlmFallbackToHeuristics { get; set; }
     /// <summary>Never the raw key — only "(set)" or "(empty)".</summary>
     public string LlmApiKey { get; set; } = "(empty)";
+
+    /// <summary>Present only when <c>cluster.enabled</c> is true. Omitted otherwise.</summary>
+    public ClusterHealthInfo? Cluster { get; set; }
 }
