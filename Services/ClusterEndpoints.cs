@@ -1,0 +1,345 @@
+using System.Text.RegularExpressions;
+using MiniOcr.Models;
+
+namespace MiniOcr.Services;
+
+/// <summary>Authenticated cluster routes. Mapped only when clustering is enabled.</summary>
+public static partial class ClusterEndpoints
+{
+    [GeneratedRegex("^[A-Za-z0-9_-]{8,64}$", RegexOptions.CultureInvariant)]
+    private static partial Regex JobIdPattern();
+
+    public static void Map(WebApplication app)
+    {
+        app.MapGet("/cluster/info", (HttpRequest http, ClusterRuntimeConfig cfg, ClusterSelf self, ClusterWorkerHost worker) =>
+        {
+            if (!Authorize(http, cfg, out IResult? deny))
+                return deny!;
+            return Results.Json(worker.Info(), AppJsonContext.Default.ClusterInfoResponse);
+        });
+
+        app.MapPost("/cluster/register", async Task<IResult> (
+            HttpRequest http,
+            ClusterRuntimeConfig cfg,
+            ClusterCoordinator coordinator,
+            CancellationToken ct) =>
+        {
+            if (!Authorize(http, cfg, out IResult? deny))
+                return deny!;
+            if (!cfg.IsCoordinator)
+                return Ack(StatusCodes.Status409Conflict, "This node is not a coordinator.");
+
+            ClusterRegisterRequest? body;
+            try
+            {
+                body = await http.ReadFromJsonAsync(AppJsonContext.Default.ClusterRegisterRequest, ct)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                return Ack(StatusCodes.Status400BadRequest, "Invalid JSON body.");
+            }
+
+            if (body is null || string.IsNullOrWhiteSpace(body.NodeId))
+                return Ack(StatusCodes.Status400BadRequest, "nodeId is required.");
+
+            string? warning;
+            try
+            {
+                warning = coordinator.Register(body);
+            }
+            catch (ArgumentException ex)
+            {
+                return Ack(StatusCodes.Status400BadRequest, ex.Message);
+            }
+
+            return Results.Json(
+                new ClusterRegisterResponse
+                {
+                    Ok = true,
+                    Warning = warning,
+                    OcrMode = coordinator.BuildHealth().OcrMode,
+                    Model = coordinator.BuildHealth().Model,
+                    Dpi = coordinator.BuildHealth().Dpi,
+                },
+                AppJsonContext.Default.ClusterRegisterResponse);
+        });
+
+        app.MapPost("/cluster/heartbeat", async Task<IResult> (
+            HttpRequest http,
+            ClusterRuntimeConfig cfg,
+            ClusterCoordinator coordinator,
+            CancellationToken ct) =>
+        {
+            if (!Authorize(http, cfg, out IResult? deny))
+                return deny!;
+            if (!cfg.IsCoordinator)
+                return Ack(StatusCodes.Status409Conflict, "This node is not a coordinator.");
+            ClusterHeartbeatRequest? body;
+            try
+            {
+                body = await http.ReadFromJsonAsync(AppJsonContext.Default.ClusterHeartbeatRequest, ct)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                return Ack(StatusCodes.Status400BadRequest, "Invalid JSON body.");
+            }
+
+            if (body is null || string.IsNullOrWhiteSpace(body.NodeId))
+                return Ack(StatusCodes.Status400BadRequest, "nodeId is required.");
+            coordinator.Heartbeat(body);
+            return Ack(StatusCodes.Status200OK, null);
+        });
+
+        app.MapPost("/cluster/dispatch", async Task<IResult> (
+            HttpRequest http,
+            ClusterRuntimeConfig cfg,
+            ClusterCoordinator coordinator,
+            CancellationToken ct) =>
+        {
+            if (!Authorize(http, cfg, out IResult? deny))
+                return deny!;
+            if (!cfg.IsCoordinator)
+                return Ack(StatusCodes.Status409Conflict, "This node is not a coordinator.");
+            ClusterDispatchRequest? body;
+            try
+            {
+                body = await http.ReadFromJsonAsync(AppJsonContext.Default.ClusterDispatchRequest, ct)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                return Ack(StatusCodes.Status400BadRequest, "Invalid JSON body.");
+            }
+
+            body ??= new ClusterDispatchRequest();
+            ClusterDispatchResponse response = coordinator.Dispatch(body.NodeId ?? "", body.Capacity, body.ActiveJobs);
+            return Results.Json(response, AppJsonContext.Default.ClusterDispatchResponse);
+        });
+
+        app.MapPost("/cluster/notify", async Task<IResult> (
+            HttpRequest http,
+            ClusterRuntimeConfig cfg,
+            ClusterWorkerHost worker,
+            CancellationToken ct) =>
+        {
+            if (!Authorize(http, cfg, out IResult? deny))
+                return deny!;
+            ClusterNotifyRequest? body;
+            try
+            {
+                body = await http.ReadFromJsonAsync(AppJsonContext.Default.ClusterNotifyRequest, ct)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                return Ack(StatusCodes.Status400BadRequest, "Invalid JSON body.");
+            }
+
+            if (body is null)
+                return Ack(StatusCodes.Status400BadRequest, "Empty body.");
+            if (!worker.TryStartNotified(body, out string? error))
+            {
+                int code = error is not null && error.Contains("capacity", StringComparison.OrdinalIgnoreCase)
+                    ? StatusCodes.Status429TooManyRequests
+                    : StatusCodes.Status409Conflict;
+                return Ack(code, error);
+            }
+
+            return Ack(StatusCodes.Status200OK, null);
+        });
+
+        app.MapGet("/cluster/jobs/{jobId}/pdf", (string jobId, HttpRequest http, ClusterRuntimeConfig cfg, ClusterCoordinator coordinator) =>
+        {
+            if (!Authorize(http, cfg, out IResult? deny))
+                return deny!;
+            if (!TryJob(coordinator, cfg, jobId, out ClusterJob? job, out IResult? missing))
+                return missing!;
+            IDisposable? lease = job!.TryEnterPdfRead();
+            if (lease is null)
+                return Ack(StatusCodes.Status409Conflict, "Job is closing.");
+
+            byte[] pdf = job.Pdf;
+            int length = job.PdfLength;
+            return Results.Stream(async body =>
+            {
+                try
+                {
+                    await body.WriteAsync(pdf.AsMemory(0, length)).ConfigureAwait(false);
+                }
+                finally
+                {
+                    lease.Dispose();
+                }
+            }, "application/pdf");
+        });
+
+        app.MapPost("/cluster/jobs/{jobId}/join", async Task<IResult> (
+            string jobId,
+            HttpRequest http,
+            ClusterRuntimeConfig cfg,
+            ClusterCoordinator coordinator,
+            CancellationToken ct) =>
+        {
+            if (!Authorize(http, cfg, out IResult? deny))
+                return deny!;
+            if (!TryJob(coordinator, cfg, jobId, out ClusterJob? job, out IResult? missing))
+                return missing!;
+            ClusterJoinRequest? body;
+            try
+            {
+                body = await http.ReadFromJsonAsync(AppJsonContext.Default.ClusterJoinRequest, ct)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                return Ack(StatusCodes.Status400BadRequest, "Invalid JSON body.");
+            }
+
+            if (body is null || string.IsNullOrWhiteSpace(body.NodeId))
+                return Ack(StatusCodes.Status400BadRequest, "nodeId is required.");
+            if (!coordinator.Join(job!, body.NodeId.Trim(), body.Capacity))
+                return Ack(StatusCodes.Status409Conflict, "Job is finished.");
+            return Ack(StatusCodes.Status200OK, null);
+        });
+
+        app.MapPost("/cluster/jobs/{jobId}/claim", async Task<IResult> (
+            string jobId,
+            HttpRequest http,
+            ClusterRuntimeConfig cfg,
+            ClusterCoordinator coordinator,
+            CancellationToken ct) =>
+        {
+            if (!Authorize(http, cfg, out IResult? deny))
+                return deny!;
+            if (!TryJob(coordinator, cfg, jobId, out ClusterJob? job, out IResult? missing))
+                return missing!;
+            ClusterClaimRequest? body;
+            try
+            {
+                body = await http.ReadFromJsonAsync(AppJsonContext.Default.ClusterClaimRequest, ct)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                return Ack(StatusCodes.Status400BadRequest, "Invalid JSON body.");
+            }
+
+            if (body is null || string.IsNullOrWhiteSpace(body.NodeId))
+                return Ack(StatusCodes.Status400BadRequest, "nodeId is required.");
+            ClusterClaimResponse claim = coordinator.Claim(job!, body.NodeId.Trim(), body.MaxPages);
+            return Results.Json(claim, AppJsonContext.Default.ClusterClaimResponse);
+        });
+
+        app.MapPost("/cluster/jobs/{jobId}/result", async Task<IResult> (
+            string jobId,
+            HttpRequest http,
+            ClusterRuntimeConfig cfg,
+            ClusterCoordinator coordinator,
+            CancellationToken ct) =>
+        {
+            if (!Authorize(http, cfg, out IResult? deny))
+                return deny!;
+            if (!TryJob(coordinator, cfg, jobId, out ClusterJob? job, out IResult? missing))
+                return missing!;
+            ClusterResultRequest? body;
+            try
+            {
+                body = await http.ReadFromJsonAsync(AppJsonContext.Default.ClusterResultRequest, ct)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                return Ack(StatusCodes.Status400BadRequest, "Invalid JSON body.");
+            }
+
+            if (body is null || string.IsNullOrWhiteSpace(body.BatchId))
+                return Ack(StatusCodes.Status400BadRequest, "batchId is required.");
+            int accepted = coordinator.AcceptResults(job!, body.BatchId, body.Pages);
+            return Results.Json(
+                new ClusterAck { Ok = true, Accepted = accepted },
+                AppJsonContext.Default.ClusterAck);
+        });
+
+        app.MapPost("/cluster/jobs/{jobId}/fail", async Task<IResult> (
+            string jobId,
+            HttpRequest http,
+            ClusterRuntimeConfig cfg,
+            ClusterCoordinator coordinator,
+            CancellationToken ct) =>
+        {
+            if (!Authorize(http, cfg, out IResult? deny))
+                return deny!;
+            if (!TryJob(coordinator, cfg, jobId, out ClusterJob? job, out IResult? missing))
+                return missing!;
+            ClusterFailRequest? body;
+            try
+            {
+                body = await http.ReadFromJsonAsync(AppJsonContext.Default.ClusterFailRequest, ct)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                return Ack(StatusCodes.Status400BadRequest, "Invalid JSON body.");
+            }
+
+            if (body is null || string.IsNullOrWhiteSpace(body.BatchId))
+                return Ack(StatusCodes.Status400BadRequest, "batchId is required.");
+            coordinator.FailBatch(job!, body.NodeId ?? "", body.BatchId, body.Error);
+            return Ack(StatusCodes.Status200OK, null);
+        });
+    }
+
+    private static bool Authorize(HttpRequest http, ClusterRuntimeConfig cfg, out IResult? deny)
+    {
+        if (ClusterAuth.IsAuthorized(http, cfg.Token))
+        {
+            deny = null;
+            return true;
+        }
+
+        deny = Results.Json(
+            new ClusterAck { Ok = false, Error = "Unauthorized." },
+            AppJsonContext.Default.ClusterAck,
+            statusCode: StatusCodes.Status401Unauthorized);
+        return false;
+    }
+
+    private static bool TryJob(
+        ClusterCoordinator coordinator,
+        ClusterRuntimeConfig cfg,
+        string jobId,
+        out ClusterJob? job,
+        out IResult? error)
+    {
+        job = null;
+        error = null;
+        if (!cfg.IsCoordinator)
+        {
+            error = Ack(StatusCodes.Status409Conflict, "This node is not a coordinator.");
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(jobId) || !JobIdPattern().IsMatch(jobId))
+        {
+            error = Ack(StatusCodes.Status400BadRequest, "Invalid job id.");
+            return false;
+        }
+
+        job = coordinator.FindJob(jobId);
+        if (job is null)
+        {
+            error = Ack(StatusCodes.Status404NotFound, "Unknown job.");
+            return false;
+        }
+
+        return true;
+    }
+
+    private static IResult Ack(int status, string? error) =>
+        Results.Json(
+            new ClusterAck { Ok = status is >= 200 and < 300, Error = error },
+            AppJsonContext.Default.ClusterAck,
+            statusCode: status);
+}

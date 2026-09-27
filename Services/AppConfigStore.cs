@@ -409,6 +409,23 @@ public static class AppConfigStore
             "wechatFallbackToLocal": true,
             "wechatConnectTimeoutSeconds": 20,
             "wechatRequestTimeoutSeconds": 60
+          },
+          "cluster": {
+            "enabled": false,
+            "role": "coordinator",
+            "nodeId": "",
+            "advertiseUrl": "",
+            "token": "",
+            "coordinatorUrl": "",
+            "capacity": null,
+            "pagesPerBatch": null,
+            "leaseSeconds": 20,
+            "pageTimeoutSeconds": 20,
+            "healthIntervalSeconds": 5,
+            "jobDeadlineSeconds": 300,
+            "joinGraceMs": 500,
+            "speculativeTailPages": 4,
+            "workers": []
           }
         }
         """;

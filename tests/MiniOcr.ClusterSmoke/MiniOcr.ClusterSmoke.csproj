@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net11.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>MiniOcr.ClusterSmoke</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <PublishAot>false</PublishAot>
+  </PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="..\..\Services\ClusterPageScheduler.cs" Link="ClusterPageScheduler.cs" />
+    <Compile Include="..\..\Services\ClusterNodeRegistry.cs" Link="ClusterNodeRegistry.cs" />
+    <Compile Include="..\..\Services\ClusterRuntimeConfig.cs" Link="ClusterRuntimeConfig.cs" />
+    <Compile Include="..\..\Services\ClusterAuth.cs" Link="ClusterAuth.cs" />
+    <Compile Include="..\..\Services\LlmPageGrouper.cs" Link="LlmPageGrouper.cs" />
+    <Compile Include="..\..\Models\ClusterModels.cs" Link="ClusterModels.cs" />
+    <Compile Include="..\..\Models\AppConfigModels.cs" Link="AppConfigModels.cs" />
+    <Compile Include="..\..\Models\OcrModels.cs" Link="OcrModels.cs" />
+    <Compile Include="..\..\Models\ChallengeModels.cs" Link="ChallengeModels.cs" />
+  </ItemGroup>
+</Project>
