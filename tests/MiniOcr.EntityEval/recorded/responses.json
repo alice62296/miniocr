@@ -1,0 +1,65 @@
+{
+  "note": "Simulated imperfect chat-completion payloads. They are not a live model. Spacing, titles, short names, courts, masked names, and one missed person are intentional.",
+  "samples": [
+    {
+      "id": "contract-noisy-spaces",
+      "persons": ["张 伟", "李娜女士", "张某", "甲方"],
+      "companies": ["北京华为技术有限公司", "上海浦东发展银行", "智慧园区一期", "甲方"]
+    },
+    {
+      "id": "court-judgment",
+      "persons": ["张某", "张利东", "刘洋", "李某某", "王强", "原告"],
+      "companies": ["北京字节跳动科技有限公司", "北京市海淀区人民法院", "北京天元律师事务所"]
+    },
+    {
+      "id": "company-split-lines",
+      "persons": ["游春燕", "经办人"],
+      "companies": ["成都交子商圈物业服务有限公司", "甲方"]
+    },
+    {
+      "id": "company-split-pages",
+      "persons": ["赵敏"],
+      "companies": ["深圳前海微众银行股份有限公司"]
+    },
+    {
+      "id": "english-parties",
+      "persons": ["John Smith", "Mary Anne Blake"],
+      "companies": ["Acme Trading Ltd", "Microsoft Corporation", "Surface Pro"]
+    },
+    {
+      "id": "full-name-and-branch",
+      "persons": [],
+      "companies": ["北京星河科技有限公司", "北京星河科技有限公司深圳分公司", "星河科技", "中国工商银行股份有限公司", "中国工商银行"]
+    },
+    {
+      "id": "person-inside-company",
+      "persons": ["李宁", "周杰", "欧阳锋"],
+      "companies": ["李宁体育用品有限公司"]
+    },
+    {
+      "id": "fullwidth-parens",
+      "persons": ["周瑜先生"],
+      "companies": ["华为技术（中国）有限公司"]
+    },
+    {
+      "id": "government-and-institutions",
+      "persons": ["甲方"],
+      "companies": ["北京市市场监督管理局", "清华科技园有限公司", "清华大学", "北京协和医院"]
+    },
+    {
+      "id": "minority-name",
+      "persons": ["买买提 · 艾力", "申请人"],
+      "companies": ["新疆绿洲农业发展有限公司"]
+    },
+    {
+      "id": "repeated-mention",
+      "persons": ["张伟", "签署人"],
+      "companies": ["杭州阿里巴巴网络科技有限公司", "阿里巴巴"]
+    },
+    {
+      "id": "masked-only",
+      "persons": ["张某某", "李某甲", "原告", "被告"],
+      "companies": []
+    }
+  ]
+}
