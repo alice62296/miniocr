@@ -161,6 +161,14 @@ public static class AppConfigStore
             pagesPerRequest = parsedPages;
         }
 
+        int pageGroupOverlap = llm.PageGroupOverlap;
+        string? envOverlap = Environment.GetEnvironmentVariable("MINIOCR_LLM_PAGE_GROUP_OVERLAP");
+        if (!string.IsNullOrWhiteSpace(envOverlap) &&
+            int.TryParse(envOverlap.Trim(), out int parsedOverlap))
+        {
+            pageGroupOverlap = parsedOverlap;
+        }
+
         int maxConcurrency = llm.MaxConcurrency <= 0 ? 8 : llm.MaxConcurrency;
         string? envConcurrency = Environment.GetEnvironmentVariable("MINIOCR_LLM_MAX_CONCURRENCY");
         if (!string.IsNullOrWhiteSpace(envConcurrency) &&
@@ -202,6 +210,7 @@ public static class AppConfigStore
             MaxCharsPerRequest = Math.Clamp(
                 llm.MaxCharsPerRequest <= 0 ? 300_000 : llm.MaxCharsPerRequest, 1000, 2_000_000),
             PagesPerRequest = Math.Clamp(pagesPerRequest, 1, 2000),
+            PageGroupOverlap = Math.Clamp(pageGroupOverlap, 0, 5),
             MaxConcurrency = Math.Clamp(maxConcurrency, 1, 32),
             OcrConcurrency = Math.Clamp(ocrConcurrency, 1, 256),
             OcrMaxCharsHint = Math.Clamp(ocrMaxChars, 500, 100_000),
@@ -387,6 +396,7 @@ public static class AppConfigStore
             "timeoutSeconds": 120,
             "maxCharsPerRequest": 300000,
             "pagesPerRequest": 10,
+            "pageGroupOverlap": 1,
             "maxConcurrency": 8,
             "ocrConcurrency": 32,
             "ocrMaxCharsHint": 8000,

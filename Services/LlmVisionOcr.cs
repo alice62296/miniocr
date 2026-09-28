@@ -2,7 +2,6 @@ using System.Diagnostics;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using MiniOcr.Models;
 using SkiaSharp;
 
@@ -13,7 +12,7 @@ namespace MiniOcr.Services;
 /// POST {baseUrl}/v1/chat/completions with image_url data URLs.
 /// AOT-safe: HttpClient + source-generated JSON. Never logs apiKey.
 /// </summary>
-public sealed partial class LlmVisionOcr
+public sealed class LlmVisionOcr
 {
     private const string SystemPrompt =
         "You are a document OCR and entity extraction engine for Chinese and English PDFs. " +
@@ -27,7 +26,14 @@ public sealed partial class LlmVisionOcr
         "Rules:\n" +
         "- text: complete readable page text (preserve reading order; omit pure noise).\n" +
         "- B04 items use personName only; B06 items use companyName only.\n" +
-        "- count = number of occurrences on this page; originText length 10–100 chars each.\n" +
+        "- persons: natural names only. Strip 先生/女士/经理. No roles alone (原告, 甲方, 法定代表人), no pronouns, no masked names (张某, 李某某).\n" +
+        "- companies: full legal names ending in 公司/集团/银行/事务所/合伙企业 or Inc/Ltd/LLC/Corp. " +
+        "If both a short name and the full name are visible, output only the full name. " +
+        "Keep a parent and its 分公司/分行 when both are visible.\n" +
+        "- Do not output courts, procuratorates, governments, 公安/管理局/仲裁委员会, or universities/hospitals/schools unless the name contains 公司.\n" +
+        "- Do not output product names, addresses, or project titles.\n" +
+        "- Join characters split by spaces or line breaks. Do not invent characters that are not on the page.\n" +
+        "- count = number of occurrences on this page; originText length 10–100 chars each and must contain the name.\n" +
         "- Do not invent names absent from the image. Empty ruleList is allowed if none found.\n" +
         "- Omit a rule entirely when its ruleItemList would be empty.";
 
@@ -160,7 +166,7 @@ public sealed partial class LlmVisionOcr
         if (string.IsNullOrWhiteSpace(content))
             throw new InvalidOperationException("LLM vision OCR returned empty message content.");
 
-        string json = StripMarkdownFence(content.Trim());
+        string json = NerPrompt.ExtractJsonObject(content);
         LlmVisionOcrPayload? payload =
             JsonSerializer.Deserialize(json, AppJsonContext.Default.LlmVisionOcrPayload);
         return payload ?? new LlmVisionOcrPayload();
@@ -187,8 +193,8 @@ public sealed partial class LlmVisionOcr
                 {
                     if (code == "B04")
                     {
-                        string name = NormalizeName(item.PersonName);
-                        if (name.Length == 0)
+                        string name = EntityText.RepairPerson(item.PersonName);
+                        if (!EntityPostProcessor.IsAcceptablePerson(name))
                             continue;
                         List<string> origins = SanitizeOrigins(item.OriginText, pageText, name);
                         int count = item.Count > 0 ? item.Count : Math.Max(1, origins.Count);
@@ -201,8 +207,8 @@ public sealed partial class LlmVisionOcr
                     }
                     else
                     {
-                        string name = NormalizeName(item.CompanyName);
-                        if (name.Length == 0)
+                        string name = EntityText.Repair(item.CompanyName);
+                        if (!EntityPostProcessor.IsAcceptableCompany(name))
                             continue;
                         List<string> origins = SanitizeOrigins(item.OriginText, pageText, name);
                         int count = item.Count > 0 ? item.Count : Math.Max(1, origins.Count);
@@ -226,7 +232,7 @@ public sealed partial class LlmVisionOcr
                 });
             }
 
-            return cleaned.Count > 0 ? cleaned : null;
+            return RefineAgainstPage(cleaned.Count > 0 ? cleaned : null, pageText);
         }
 
         // Fallback: companies/persons arrays → build via ChallengeResultMapper helpers
@@ -236,8 +242,8 @@ public sealed partial class LlmVisionOcr
         {
             foreach (string p in payload.Persons)
             {
-                string n = NormalizeName(p);
-                if (n.Length > 0)
+                string n = EntityText.RepairPerson(p);
+                if (EntityPostProcessor.IsAcceptablePerson(n))
                     persons.Add(n);
             }
         }
@@ -246,8 +252,8 @@ public sealed partial class LlmVisionOcr
         {
             foreach (string c in payload.Companies)
             {
-                string n = NormalizeName(c);
-                if (n.Length > 0)
+                string n = EntityText.Repair(c);
+                if (EntityPostProcessor.IsAcceptableCompany(n))
                     companies.Add(n);
             }
         }
@@ -260,6 +266,45 @@ public sealed partial class LlmVisionOcr
             [new OcrPageResult { Page = 1, Text = pageText }],
             companies,
             persons);
+        List<ChallengeRule>? fromArrays = mapped.Pages.Count > 0 && mapped.Pages[0].RuleList.Count > 0
+            ? mapped.Pages[0].RuleList
+            : null;
+        return RefineAgainstPage(fromArrays, pageText);
+    }
+
+    /// <summary>
+    /// When the page text is present, keep only names that survive the same
+    /// alignment and filters as text NER, and rebuild count / originText from the text.
+    /// </summary>
+    private static List<ChallengeRule>? RefineAgainstPage(List<ChallengeRule>? rules, string pageText)
+    {
+        if (rules is null || rules.Count == 0 || string.IsNullOrWhiteSpace(pageText))
+            return rules;
+
+        List<string> persons = [];
+        List<string> companies = [];
+        foreach (ChallengeRule rule in rules)
+        {
+            if (rule.RuleItemList is null)
+                continue;
+            foreach (ChallengeRuleItem item in rule.RuleItemList)
+            {
+                if (rule.RuleCode == "B04" && !string.IsNullOrWhiteSpace(item.PersonName))
+                    persons.Add(item.PersonName);
+                else if (rule.RuleCode == "B06" && !string.IsNullOrWhiteSpace(item.CompanyName))
+                    companies.Add(item.CompanyName);
+            }
+        }
+
+        OcrEntities entities = EntityPostProcessor.Merge(
+            [new OcrPageResult { Page = 1, Text = pageText }],
+            companies,
+            persons);
+        ChallengeFileResult mapped = ChallengeResultMapper.BuildFileResult(
+            "tmp",
+            [new OcrPageResult { Page = 1, Text = pageText }],
+            entities.Companies.Select(c => c.Name).ToList(),
+            entities.Persons.Select(p => p.Name).ToList());
         return mapped.Pages.Count > 0 && mapped.Pages[0].RuleList.Count > 0
             ? mapped.Pages[0].RuleList
             : null;
@@ -300,26 +345,4 @@ public sealed partial class LlmVisionOcr
         return result;
     }
 
-    private static string NormalizeName(string? raw)
-    {
-        if (string.IsNullOrWhiteSpace(raw))
-            return "";
-        return MultiSpaceRegex().Replace(raw.Trim(), " ");
-    }
-
-    private static string StripMarkdownFence(string content)
-    {
-        if (!content.StartsWith("```", StringComparison.Ordinal))
-            return content;
-        int firstNl = content.IndexOf('\n');
-        if (firstNl < 0)
-            return content;
-        int end = content.LastIndexOf("```", StringComparison.Ordinal);
-        if (end <= firstNl)
-            return content;
-        return content[(firstNl + 1)..end].Trim();
-    }
-
-    [GeneratedRegex(@"[ \t\u3000]+")]
-    private static partial Regex MultiSpaceRegex();
 }
