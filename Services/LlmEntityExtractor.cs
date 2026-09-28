@@ -275,7 +275,7 @@ public sealed class LlmEntityExtractor
         string raw = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode)
         {
-            string snippet = raw.Length > 240 ? raw[..240] + "\u2026" : raw;
+            string snippet = raw.Length > 240 ? raw[..240] + "…" : raw;
             throw new HttpRequestException(
                 $"LLM chat completions failed HTTP {(int)response.StatusCode}: {snippet}");
         }
