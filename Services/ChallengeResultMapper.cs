@@ -54,13 +54,15 @@ public static class ChallengeResultMapper
         IReadOnlyList<string> personNames)
     {
         List<ChallengePageResult> pageResults = new(pages.Count);
-        foreach (OcrPageResult page in pages)
+        for (int i = 0; i < pages.Count; i++)
         {
+            OcrPageResult page = pages[i];
             if (!IncludeInOutput(page))
                 continue;
+            string? lookahead = EntityText.Lookahead(pages, i);
             string text = page.Text ?? "";
-            List<ChallengeRuleItem> personItems = BuildPersonItems(text, personNames);
-            List<ChallengeRuleItem> companyItems = BuildCompanyItems(text, companyNames);
+            List<ChallengeRuleItem> personItems = BuildPersonItems(text, lookahead, personNames, companyNames);
+            List<ChallengeRuleItem> companyItems = BuildCompanyItems(text, lookahead, companyNames);
 
             List<ChallengeRule> rules = [];
             if (personItems.Count > 0)
@@ -97,7 +99,11 @@ public static class ChallengeResultMapper
         };
     }
 
-    private static List<ChallengeRuleItem> BuildPersonItems(string text, IReadOnlyList<string> names)
+    private static List<ChallengeRuleItem> BuildPersonItems(
+        string text,
+        string? lookahead,
+        IReadOnlyList<string> names,
+        IReadOnlyList<string> companies)
     {
         List<ChallengeRuleItem> items = [];
         HashSet<string> seen = new(StringComparer.Ordinal);
@@ -105,7 +111,15 @@ public static class ChallengeResultMapper
         {
             if (string.IsNullOrWhiteSpace(name) || !seen.Add(name))
                 continue;
-            List<string> origins = BuildOriginTexts(text, name);
+            List<string> covers = new(companies.Count + names.Count);
+            covers.AddRange(companies);
+            foreach (string other in names)
+            {
+                if (other.Length > name.Length)
+                    covers.Add(other);
+            }
+
+            List<string> origins = BuildOriginTexts(text, name, lookahead, covers);
             if (origins.Count == 0)
                 continue;
             items.Add(new ChallengeRuleItem
@@ -119,7 +133,10 @@ public static class ChallengeResultMapper
         return items;
     }
 
-    private static List<ChallengeRuleItem> BuildCompanyItems(string text, IReadOnlyList<string> names)
+    private static List<ChallengeRuleItem> BuildCompanyItems(
+        string text,
+        string? lookahead,
+        IReadOnlyList<string> names)
     {
         List<ChallengeRuleItem> items = [];
         HashSet<string> seen = new(StringComparer.Ordinal);
@@ -127,7 +144,7 @@ public static class ChallengeResultMapper
         {
             if (string.IsNullOrWhiteSpace(name) || !seen.Add(name))
                 continue;
-            List<string> origins = BuildOriginTexts(text, name);
+            List<string> origins = BuildOriginTexts(text, name, lookahead, names);
             if (origins.Count == 0)
                 continue;
             items.Add(new ChallengeRuleItem
@@ -144,70 +161,58 @@ public static class ChallengeResultMapper
     /// <summary>
     /// For each occurrence of <paramref name="name"/> in <paramref name="pageText"/>,
     /// emit one excerpt of length in [10, 100] centered on the match when possible.
+    /// Intra-CJK spaces are folded the same way as the reported name, so the excerpt
+    /// contains that name. <paramref name="lookahead"/> is the start of the next
+    /// non-empty page, used when a name is split by the page break.
+    /// Hits covered by a longer name in <paramref name="coverNames"/> are skipped.
     /// </summary>
-    public static List<string> BuildOriginTexts(string pageText, string name)
+    public static List<string> BuildOriginTexts(
+        string pageText,
+        string name,
+        string? lookahead = null,
+        IReadOnlyList<string>? coverNames = null)
     {
         List<string> texts = [];
-        if (string.IsNullOrEmpty(pageText) || string.IsNullOrEmpty(name) || pageText.Length < name.Length)
+        if (string.IsNullOrEmpty(pageText) || string.IsNullOrEmpty(name))
             return texts;
 
-        int idx = 0;
-        while (idx <= pageText.Length - name.Length)
+        EntityText.PageIndex index = EntityText.PageIndex.Build(pageText, lookahead);
+        foreach (EntityText.Hit hit in index.Find(name))
         {
-            int found = pageText.IndexOf(name, idx, StringComparison.Ordinal);
-            if (found < 0)
-                break;
-
-            string snippet = SliceAround(pageText, found, name.Length);
-            if (snippet.Length >= OriginMinLen)
-                texts.Add(snippet);
-            else if (pageText.Length >= OriginMinLen)
-                texts.Add(PadToMin(pageText, found, name.Length));
-            else
-                texts.Add(pageText); // whole page shorter than 10 — still report something
-
-            idx = found + Math.Max(1, name.Length);
+            if (IsCovered(index, hit, name, coverNames))
+                continue;
+            string snippet = EntityText.Excerpt(index.Source, hit.OriginStart, hit.OriginEnd);
+            if (snippet.Length == 0)
+                continue;
+            if (snippet.Length > OriginMaxLen)
+                snippet = snippet[..OriginMaxLen];
+            texts.Add(snippet);
         }
 
         return texts;
     }
 
-    private static string SliceAround(string text, int matchStart, int matchLen)
+    private static bool IsCovered(
+        EntityText.PageIndex index,
+        EntityText.Hit hit,
+        string name,
+        IReadOnlyList<string>? coverNames)
     {
-        // Prefer ~max window centered on the name; clamp to [min, max].
-        int target = OriginMaxLen;
-        int extra = Math.Max(0, target - matchLen);
-        int left = extra / 2;
-        int right = extra - left;
-
-        int start = Math.Max(0, matchStart - left);
-        int end = Math.Min(text.Length, matchStart + matchLen + right);
-
-        // If we hit a boundary, borrow from the other side to approach target length.
-        int deficit = target - (end - start);
-        if (deficit > 0)
+        if (coverNames is null)
+            return false;
+        foreach (string other in coverNames)
         {
-            start = Math.Max(0, start - deficit);
-            deficit = target - (end - start);
-            if (deficit > 0)
-                end = Math.Min(text.Length, end + deficit);
+            if (string.IsNullOrEmpty(other) || other.Length <= name.Length)
+                continue;
+            if (!EntityText.Identity(other).Contains(EntityText.Identity(name), StringComparison.Ordinal))
+                continue;
+            foreach (EntityText.Hit outer in index.Find(other))
+            {
+                if (EntityText.Covers(outer, hit))
+                    return true;
+            }
         }
 
-        string s = text[start..end];
-        if (s.Length > OriginMaxLen)
-            s = s[..OriginMaxLen];
-        return s;
-    }
-
-    private static string PadToMin(string text, int matchStart, int matchLen)
-    {
-        int start = Math.Max(0, Math.Min(matchStart, text.Length - OriginMinLen));
-        int end = Math.Min(text.Length, start + OriginMinLen);
-        if (end - start < OriginMinLen)
-            start = Math.Max(0, end - OriginMinLen);
-        string s = text[start..end];
-        if (s.Length > OriginMaxLen)
-            s = s[..OriginMaxLen];
-        return s;
+        return false;
     }
 }

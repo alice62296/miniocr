@@ -1,7 +1,6 @@
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using MiniOcr.Models;
 
 namespace MiniOcr.Services;
@@ -11,16 +10,9 @@ namespace MiniOcr.Services;
 /// POST {baseUrl}/v1/chat/completions — works with OpenAI, DeepSeek, Azure-compatible, local.
 /// AOT-safe: HttpClient + source-generated JSON. Never logs apiKey.
 /// </summary>
-public sealed partial class LlmEntityExtractor
+public sealed class LlmEntityExtractor
 {
-    private const string SystemPrompt =
-        "You extract company/organization names and person names from OCR text. " +
-        "The user message may contain several PDF pages. Each page starts with a line " +
-        "\"--- page N ---\" where N is the original page number. Read every page. " +
-        "Support Chinese and English. Return ONLY strict JSON with shape " +
-        "{\"companies\":[\"...\"],\"persons\":[\"...\"]}. " +
-        "Do not invent names that are not present in the text. " +
-        "No markdown fences, no commentary, JSON only.";
+    private const string SystemPrompt = NerPrompt.Text;
 
     private readonly HttpClient _http;
     private readonly LlmRuntimeConfig _config;
@@ -56,9 +48,10 @@ public sealed partial class LlmEntityExtractor
 
         int concurrency = Math.Clamp(_config.MaxConcurrency, 1, 32);
         _logger.LogInformation(
-            "LLM NER streaming: pageCount={PageCount}, pagesPerRequest={PagesPerRequest}, maxCharsPerRequest={MaxChars}, maxConcurrency={MaxConcurrency}",
+            "LLM NER streaming: pageCount={PageCount}, pagesPerRequest={PagesPerRequest}, pageGroupOverlap={Overlap}, maxCharsPerRequest={MaxChars}, maxConcurrency={MaxConcurrency}",
             pageCount,
             _config.PagesPerRequest,
+            _config.PageGroupOverlap,
             _config.MaxCharsPerRequest,
             concurrency);
         return new LlmExtractionSession(this, pageCount, concurrency, ct);
@@ -110,7 +103,8 @@ public sealed partial class LlmEntityExtractor
             _buffer = new LlmPageGrouper.OrderedBuffer(
                 pageCount,
                 owner._config.PagesPerRequest,
-                owner._config.MaxCharsPerRequest);
+                owner._config.MaxCharsPerRequest,
+                owner._config.PageGroupOverlap);
         }
 
         public void Add(OcrPageResult page)
@@ -205,9 +199,8 @@ public sealed partial class LlmEntityExtractor
                 {
                     foreach (string c in payload.Companies)
                     {
-                        string n = NormalizeName(c);
-                        if (n.Length > 0)
-                            localCompanies.Add(n);
+                        if (!string.IsNullOrWhiteSpace(c))
+                            localCompanies.Add(c);
                     }
                 }
 
@@ -215,9 +208,8 @@ public sealed partial class LlmEntityExtractor
                 {
                     foreach (string person in payload.Persons)
                     {
-                        string n = NormalizeName(person);
-                        if (n.Length > 0)
-                            localPersons.Add(n);
+                        if (!string.IsNullOrWhiteSpace(person))
+                            localPersons.Add(person);
                     }
                 }
 
@@ -294,7 +286,7 @@ public sealed partial class LlmEntityExtractor
         if (string.IsNullOrWhiteSpace(content))
             throw new InvalidOperationException("LLM returned empty message content.");
 
-        string json = StripMarkdownFence(content.Trim());
+        string json = NerPrompt.ExtractJsonObject(content);
         LlmEntityPayload? payload =
             JsonSerializer.Deserialize(json, AppJsonContext.Default.LlmEntityPayload);
         return payload ?? new LlmEntityPayload();
@@ -303,121 +295,6 @@ public sealed partial class LlmEntityExtractor
     internal static OcrEntities MergeToEntities(
         IReadOnlyList<OcrPageResult> pages,
         IEnumerable<string> companies,
-        IEnumerable<string> persons)
-    {
-        EntityAccumulator acc = new();
-        foreach (string name in DedupPreserveOrder(companies))
-        {
-            for (int i = 0; i < pages.Count; i++)
-            {
-                string text = pages[i].Text ?? "";
-                if (text.Length == 0)
-                    continue;
-                int count = CountOccurrences(text, name);
-                for (int c = 0; c < count; c++)
-                    acc.AddCompany(name, pages[i].Page);
-            }
-        }
-
-        foreach (string name in DedupPreserveOrder(persons))
-        {
-            for (int i = 0; i < pages.Count; i++)
-            {
-                string text = pages[i].Text ?? "";
-                if (text.Length == 0)
-                    continue;
-                int count = CountOccurrences(text, name);
-                for (int c = 0; c < count; c++)
-                    acc.AddPerson(name, pages[i].Page);
-            }
-
-            // Name returned by LLM but OCR text mismatch (OCR noise) — still keep once on first page that fuzzy-contains, else page 1 of doc.
-            if (!acc.Persons.ContainsKey(name))
-            {
-                int page = pages.Count > 0 ? pages[0].Page : 1;
-                foreach (OcrPageResult p in pages)
-                {
-                    if ((p.Text ?? "").Contains(name, StringComparison.Ordinal))
-                    {
-                        page = p.Page;
-                        break;
-                    }
-                }
-
-                acc.AddPerson(name, page);
-            }
-        }
-
-        // Same for companies missing from page scan
-        foreach (string name in DedupPreserveOrder(companies))
-        {
-            if (!acc.Companies.ContainsKey(name))
-            {
-                int page = pages.Count > 0 ? pages[0].Page : 1;
-                foreach (OcrPageResult p in pages)
-                {
-                    if ((p.Text ?? "").Contains(name, StringComparison.Ordinal))
-                    {
-                        page = p.Page;
-                        break;
-                    }
-                }
-
-                acc.AddCompany(name, page);
-            }
-        }
-
-        return EntityExtractor.ToEntities(acc);
-    }
-
-    private static IEnumerable<string> DedupPreserveOrder(IEnumerable<string> names)
-    {
-        HashSet<string> seen = new(StringComparer.Ordinal);
-        foreach (string n in names)
-        {
-            if (seen.Add(n))
-                yield return n;
-        }
-    }
-
-    private static int CountOccurrences(string text, string name)
-    {
-        if (name.Length == 0 || text.Length < name.Length)
-            return 0;
-        int count = 0;
-        int idx = 0;
-        while (idx <= text.Length - name.Length)
-        {
-            int found = text.IndexOf(name, idx, StringComparison.Ordinal);
-            if (found < 0)
-                break;
-            count++;
-            idx = found + name.Length;
-        }
-
-        return count;
-    }
-
-    private static string NormalizeName(string? raw)
-    {
-        if (string.IsNullOrWhiteSpace(raw))
-            return "";
-        return MultiSpaceRegex().Replace(raw.Trim(), " ");
-    }
-
-    private static string StripMarkdownFence(string content)
-    {
-        if (!content.StartsWith("```", StringComparison.Ordinal))
-            return content;
-        int firstNl = content.IndexOf('\n');
-        if (firstNl < 0)
-            return content;
-        int end = content.LastIndexOf("```", StringComparison.Ordinal);
-        if (end <= firstNl)
-            return content;
-        return content[(firstNl + 1)..end].Trim();
-    }
-
-    [GeneratedRegex(@"[ \t\u3000]+")]
-    private static partial Regex MultiSpaceRegex();
+        IEnumerable<string> persons) =>
+        EntityPostProcessor.Merge(pages, companies, persons);
 }

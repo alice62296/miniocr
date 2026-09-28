@@ -1,0 +1,152 @@
+{
+  "samples": [
+    {
+      "id": "contract-noisy-spaces",
+      "note": "Paddle-style spaces between Han characters, a product title, and a role label.",
+      "pages": [
+        {
+          "page": 1,
+          "text": "合 同 编 号：HT-2026-018\n甲 方：北 京 华 为 技 术 有 限 公 司\n乙 方：上 海 浦 东 发 展 银 行 股 份 有 限 公 司\n法定代表人：张 伟\n联系人：李娜女士\n项目名称：智慧园区一期\n地址：北京市海淀区中关村大街1号\n"
+        }
+      ],
+      "persons": ["张伟", "李娜"],
+      "companies": ["北京华为技术有限公司", "上海浦东发展银行股份有限公司"]
+    },
+    {
+      "id": "court-judgment",
+      "note": "Masked names, a court, and a law firm. Gold keeps natural persons and commercial parties only.",
+      "pages": [
+        {
+          "page": 2,
+          "text": "北京市海淀区人民法院\n民事判决书\n原告：张某，男，住址略。\n被告：北京字节跳动科技有限公司\n法定代表人：张利东\n委托诉讼代理人：刘洋，北京天元律师事务所律师\n本院认为，李某某所述不能采信。\n审判长：王强\n书记员：陈晨\n"
+        }
+      ],
+      "persons": ["张利东", "刘洋", "王强", "陈晨"],
+      "companies": ["北京字节跳动科技有限公司", "北京天元律师事务所"]
+    },
+    {
+      "id": "company-split-lines",
+      "note": "Legal name broken across a line break.",
+      "pages": [
+        {
+          "page": 3,
+          "text": "甲方（出卖人）：成都交子商圈物业\n服务有限公司\n签订日期：2026年3月1日\n经办人：游春燕\n"
+        }
+      ],
+      "persons": ["游春燕"],
+      "companies": ["成都交子商圈物业服务有限公司"]
+    },
+    {
+      "id": "company-split-pages",
+      "note": "Legal name cut by a page boundary. The person is only on the second page.",
+      "pages": [
+        {
+          "page": 8,
+          "text": "贷款人：深圳前海微众银行股份"
+        },
+        {
+          "page": 9,
+          "text": "有限公司。借款人签字：赵敏。"
+        }
+      ],
+      "persons": ["赵敏"],
+      "companies": ["深圳前海微众银行股份有限公司"]
+    },
+    {
+      "id": "english-parties",
+      "note": "English company suffixes and two- and three-token personal names. Surface Pro is a product.",
+      "pages": [
+        {
+          "page": 1,
+          "text": "Party A: Acme Trading Ltd.\nSigned by: John Smith\nParty B: Microsoft Corporation\nAttn: Mary Anne Blake\n产品：Surface Pro\n"
+        }
+      ],
+      "persons": ["John Smith", "Mary Anne Blake"],
+      "companies": ["Acme Trading Ltd.", "Microsoft Corporation"]
+    },
+    {
+      "id": "full-name-and-branch",
+      "note": "Short form versus full legal name, plus a branch that is a separate entity.",
+      "pages": [
+        {
+          "page": 4,
+          "text": "买方：北京星河科技有限公司\n卖方：北京星河科技有限公司深圳分公司\n简称星河科技亦见正文。\n开户行：中国工商银行股份有限公司\n（中国工商银行）\n"
+        }
+      ],
+      "persons": [],
+      "companies": ["北京星河科技有限公司", "北京星河科技有限公司深圳分公司", "中国工商银行股份有限公司"]
+    },
+    {
+      "id": "person-inside-company",
+      "note": "李宁 occurs only inside the company name. 周杰 and 欧阳锋 are real persons.",
+      "pages": [
+        {
+          "page": 1,
+          "text": "买方为李宁体育用品有限公司，联系人：周杰。\n见证人：欧阳锋\n"
+        }
+      ],
+      "persons": ["周杰", "欧阳锋"],
+      "companies": ["李宁体育用品有限公司"]
+    },
+    {
+      "id": "fullwidth-parens",
+      "note": "Fullwidth parentheses in the legal name must fold to the same identity as halfwidth.",
+      "pages": [
+        {
+          "page": 5,
+          "text": "供应商：华为技术（中国）有限公司\n授权代表：周瑜\n"
+        }
+      ],
+      "persons": ["周瑜"],
+      "companies": ["华为技术(中国)有限公司"]
+    },
+    {
+      "id": "government-and-institutions",
+      "note": "A regulator, a university, and a hospital are not B06 companies. The technology-park company is.",
+      "pages": [
+        {
+          "page": 6,
+          "text": "本合同由北京市市场监督管理局备案。\n甲方：清华科技园有限公司\n乙方：清华大学\n丙方：北京协和医院\n"
+        }
+      ],
+      "persons": [],
+      "companies": ["清华科技园有限公司"]
+    },
+    {
+      "id": "minority-name",
+      "note": "Middle-dot personal name with OCR spaces around the dot, plus a company.",
+      "pages": [
+        {
+          "page": 7,
+          "text": "申请人：买买提·艾力\n被申请人：新疆绿洲农业发展有限公司\n"
+        }
+      ],
+      "persons": ["买买提·艾力"],
+      "companies": ["新疆绿洲农业发展有限公司"]
+    },
+    {
+      "id": "repeated-mention",
+      "note": "The same person signs twice. A bare brand string is not a second company.",
+      "pages": [
+        {
+          "page": 1,
+          "text": "张伟代表杭州阿里巴巴网络科技有限公司签署。张伟再次签字。\n阿里巴巴品牌见附件。\n"
+        }
+      ],
+      "persons": ["张伟"],
+      "companies": ["杭州阿里巴巴网络科技有限公司"]
+    },
+    {
+      "id": "masked-only",
+      "note": "Anonymized names are not persons. This page has no company.",
+      "pages": [
+        {
+          "page": 1,
+          "text": "原告张某某诉被告李某甲一案，本院不予受理。\n"
+        }
+      ],
+      "persons": [],
+      "companies": []
+    }
+  ]
+}

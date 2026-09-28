@@ -4,18 +4,22 @@
     <TargetFramework>net11.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <RootNamespace>MiniOcr.EntitySmoke</RootNamespace>
+    <RootNamespace>MiniOcr.EntityEval</RootNamespace>
     <IsPackable>false</IsPackable>
-    <!-- Smoke only: no AOT publish needed -->
     <PublishAot>false</PublishAot>
   </PropertyGroup>
   <ItemGroup>
-    <Compile Include="..\..\Services\EntityExtractor.cs" Link="EntityExtractor.cs" />
+    <Compile Include="..\..\Services\NerPrompt.cs" Link="NerPrompt.cs" />
     <Compile Include="..\..\Services\EntityText.cs" Link="EntityText.cs" />
+    <Compile Include="..\..\Services\EntityPostProcessor.cs" Link="EntityPostProcessor.cs" />
     <Compile Include="..\..\Services\ChallengeResultMapper.cs" Link="ChallengeResultMapper.cs" />
     <Compile Include="..\..\Services\LlmPageGrouper.cs" Link="LlmPageGrouper.cs" />
     <Compile Include="..\..\Models\OcrModels.cs" Link="OcrModels.cs" />
     <Compile Include="..\..\Models\ClusterModels.cs" Link="ClusterModels.cs" />
     <Compile Include="..\..\Models\ChallengeModels.cs" Link="ChallengeModels.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <Content Include="dataset\**\*" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="recorded\**\*" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

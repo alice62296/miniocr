@@ -25,6 +25,11 @@ public sealed class LlmFileConfig
     public int PagesPerRequest { get; set; } = 10;
     /// <summary>Max parallel LLM NER batch completions (clamped 1–32). Default 8.</summary>
     public int MaxConcurrency { get; set; } = 8;
+    /// <summary>
+    /// Non-empty pages repeated from the end of one NER group onto the next (clamped 0–5).
+    /// Default 1, so a name split by the group boundary is still in one prompt. 0 restores non-overlapping groups.
+    /// </summary>
+    public int PageGroupOverlap { get; set; } = 1;
     /// <summary>Max parallel vision OCR page calls when ocr.mode=llm (clamped 1–256).</summary>
     public int OcrConcurrency { get; set; } = 32;
     /// <summary>Hint for max chars of page text the vision model should return.</summary>
@@ -79,6 +84,8 @@ public sealed class LlmRuntimeConfig
     /// <summary>Non-empty pages sent to one NER request. Default 10.</summary>
     public int PagesPerRequest { get; init; } = 10;
     public int MaxConcurrency { get; init; } = 8;
+    /// <summary>Non-empty pages repeated across adjacent NER groups. Default 1. Clamped to pagesPerRequest-1 at group time.</summary>
+    public int PageGroupOverlap { get; init; } = 1;
     public int OcrConcurrency { get; init; } = 32;
     public int OcrMaxCharsHint { get; init; } = 8000;
     /// <summary>JPEG quality for vision page images (40–95). Default 70.</summary>
