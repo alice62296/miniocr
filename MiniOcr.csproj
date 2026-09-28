@@ -25,6 +25,13 @@
     <StaticWebAssetsEnabled>false</StaticWebAssetsEnabled>
   </PropertyGroup>
 
+  <!-- Opt into runtime async: emit calls into the runtime's async machinery
+       (System.Runtime.CompilerServices.AsyncHelpers) instead of the compiler's
+       generated state machines. Preview feature; verify under Native AOT. -->
+  <PropertyGroup>
+    <Features>$(Features);runtime-async=on</Features>
+  </PropertyGroup>
+
   <!-- Optional true single-file bundle (NOT AOT): embeds libSkiaSharp / libpdfium and
        extracts them on first run under $HOME/.net/MiniOcr/. Competition default stays AOT. -->
   <PropertyGroup Condition="'$(MiniOcrSingleFile)' == 'true'">
