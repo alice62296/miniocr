@@ -25,6 +25,8 @@ public sealed class ClusterRuntimeConfig
     public int JobDeadlineMs { get; init; } = 300_000;
     public int JoinGraceMs { get; init; } = 500;
     public int SpeculativeTailPages { get; init; } = 4;
+    /// <summary>Promote routine dispatch logs (claim, heartbeat, batch done, empty poll) to Information.</summary>
+    public bool VerboseDispatch { get; init; }
     public IReadOnlyList<ClusterWorkerEndpoint> Workers { get; init; } = [];
     /// <summary>Set when a request to enable clustering was ignored (empty token).</summary>
     public string? DisabledReason { get; init; }
@@ -101,6 +103,11 @@ public sealed class ClusterRuntimeConfig
             ReadInt(env, "MINIOCR_CLUSTER_SPECULATIVE_TAIL", section.SpeculativeTailPages <= 0 ? 4 : section.SpeculativeTailPages),
             1, 64);
 
+        bool verboseDispatch = section.VerboseDispatch;
+        string? envVerbose = env("MINIOCR_CLUSTER_VERBOSE_DISPATCH");
+        if (!string.IsNullOrWhiteSpace(envVerbose))
+            verboseDispatch = ParseBool(envVerbose, verboseDispatch);
+
         List<ClusterWorkerEndpoint> workers = [];
         string? envWorkers = env("MINIOCR_CLUSTER_WORKERS");
         if (!string.IsNullOrWhiteSpace(envWorkers))
@@ -140,6 +147,7 @@ public sealed class ClusterRuntimeConfig
             JobDeadlineMs = deadlineSeconds * 1000,
             JoinGraceMs = joinGrace,
             SpeculativeTailPages = tail,
+            VerboseDispatch = verboseDispatch,
             Workers = workers,
             DisabledReason = disabledReason,
         };

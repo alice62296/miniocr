@@ -35,6 +35,12 @@ public sealed class ClusterFileConfig
     public int JoinGraceMs { get; set; } = 500;
     /// <summary>When this many pages are still leased and nothing is pending, idle nodes may copy the tail.</summary>
     public int SpeculativeTailPages { get; set; } = 4;
+    /// <summary>
+    /// When true, per-claim / heartbeat / batch-done / empty-poll lines are Information.
+    /// Default false: those lines are Debug. Progress summaries stay Information either way.
+    /// <c>Logging:LogLevel</c> for the cluster categories still applies.
+    /// </summary>
+    public bool VerboseDispatch { get; set; }
     public List<ClusterWorkerFileConfig>? Workers { get; set; }
 }
 

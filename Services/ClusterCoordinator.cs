@@ -35,6 +35,7 @@ public sealed class ClusterJob
         PageCount = pageCount;
         Dpi = dpi;
         Started = DateTimeOffset.UtcNow;
+        LastProgressAt = Started;
     }
 
     public string Id { get; }
@@ -45,6 +46,11 @@ public sealed class ClusterJob
     public int Dpi { get; }
     public DateTimeOffset Started { get; }
     public ConcurrentDictionary<string, byte> Joined { get; } = new(StringComparer.Ordinal);
+    internal int LastProgressDone;
+    internal int LastProgressBucket;
+    internal DateTimeOffset LastProgressAt;
+    internal bool DeferProgress;
+    internal object ProgressGate { get; } = new();
     public bool IsFinished => Volatile.Read(ref _finished) == 1;
 
     public void SetAccepted(Action<OcrPageResult> onAccepted) => _onAccepted = onAccepted;
@@ -232,6 +238,8 @@ public sealed class ClusterCoordinator : IHostedService
             foreach (ClusterJob job in _jobs.Values)
                 job.Scheduler.SetCapacity(req.NodeId, req.Capacity);
         }
+
+        ClusterJobLog.Heartbeat(_logger, _config.VerboseDispatch, req.NodeId, req.InFlight, req.Capacity);
     }
 
     public ClusterDispatchResponse Dispatch(string nodeId, int capacity, IReadOnlyList<string>? activeJobs)
@@ -271,6 +279,7 @@ public sealed class ClusterCoordinator : IHostedService
             };
         }
 
+        ClusterJobLog.DispatchWait(_logger, _config.VerboseDispatch, nodeId);
         return new ClusterDispatchResponse { Wait = true, RetryAfterMs = 300 };
     }
 
@@ -300,17 +309,8 @@ public sealed class ClusterCoordinator : IHostedService
             job.Scheduler.SetCapacity(nodeId, Math.Max(1, maxPages));
 
         ClusterClaim claim = job.Scheduler.Claim(nodeId, maxPages, DateTimeOffset.UtcNow);
-        if (claim.Kind == ClusterClaimKind.Batch)
-        {
-            _logger.LogInformation(
-                "Cluster job {JobId} claim node={Node} batch={Batch} pages={Pages} speculative={Spec} leaseMs={Lease}",
-                job.Id,
-                nodeId,
-                claim.BatchId,
-                string.Join(",", claim.Pages),
-                claim.Speculative,
-                claim.LeaseMs);
-        }
+        LogExpiries(job);
+        LogClaim(job.Id, nodeId, claim);
 
         return new ClusterClaimResponse
         {
@@ -329,10 +329,40 @@ public sealed class ClusterCoordinator : IHostedService
         if (pages is null || pages.Count == 0)
             return 0;
         int accepted = 0;
-        foreach (OcrPageResult page in pages)
+        job.DeferProgress = true;
+        try
         {
-            if (job.TryAccept(batchId, page))
-                accepted++;
+            foreach (OcrPageResult page in pages)
+            {
+                if (job.TryAccept(batchId, page))
+                    accepted++;
+            }
+        }
+        finally
+        {
+            job.DeferProgress = false;
+        }
+
+        if (accepted > 0)
+        {
+            if (_config.VerboseDispatch)
+            {
+                _logger.LogInformation(
+                    "Cluster job {JobId} batch {Batch} accepted pages={Pages}",
+                    job.Id,
+                    batchId,
+                    accepted);
+            }
+            else
+            {
+                _logger.LogDebug(
+                    "Cluster job {JobId} batch {Batch} accepted pages={Pages}",
+                    job.Id,
+                    batchId,
+                    accepted);
+            }
+
+            MaybeLogProgress(job);
         }
 
         return accepted;
@@ -384,7 +414,12 @@ public sealed class ClusterCoordinator : IHostedService
         scheduler.SetHoldLocalWindow(expectRemote && _config.JoinGraceMs > 0);
 
         var job = new ClusterJob(id, scheduler, pdf, pdfLength, pageCount, dpi);
-        job.SetAccepted(onAccepted);
+        job.SetAccepted(page =>
+        {
+            onAccepted(page);
+            if (!job.DeferProgress)
+                MaybeLogProgress(job);
+        });
         _jobs[id] = job;
 
         WarnModelMismatch(remotes, dpi);
@@ -411,6 +446,7 @@ public sealed class ClusterCoordinator : IHostedService
                     break;
 
                 ClusterClaim claim = scheduler.Claim(_config.NodeId, localCap, DateTimeOffset.UtcNow);
+                LogExpiries(job);
                 if (claim.Kind == ClusterClaimKind.Done)
                     break;
                 if (claim.Kind == ClusterClaimKind.Wait)
@@ -420,14 +456,7 @@ public sealed class ClusterCoordinator : IHostedService
                     continue;
                 }
 
-                _logger.LogInformation(
-                    "Cluster job {JobId} claim node={Node} batch={Batch} pages={Pages} speculative={Spec} leaseMs={Lease}",
-                    id,
-                    _config.NodeId,
-                    claim.BatchId,
-                    string.Join(",", claim.Pages),
-                    claim.Speculative,
-                    claim.LeaseMs);
+                LogClaim(id, _config.NodeId, claim);
 
                 try
                 {
@@ -497,14 +526,14 @@ public sealed class ClusterCoordinator : IHostedService
             }
 
             double elapsed = (DateTimeOffset.UtcNow - job.Started).TotalMilliseconds;
-            string byNode = breakdown.Count == 0
-                ? "(none)"
-                : string.Join(", ", breakdown.Select(n => n.NodeId + "=" + n.Pages));
+            string byNode = ClusterJobLog.FormatByNode(snap);
+            double pagesPerSecond = pageCount / Math.Max(0.001, elapsed / 1000.0);
             _logger.LogInformation(
-                "Cluster job {JobId} done: pages={Pages} elapsedMs={Elapsed:F0} byNode={ByNode}",
+                "Cluster job {JobId} done: pages={Pages} elapsedMs={Elapsed:F0} {Rate:F1} pages/s byNode={ByNode}",
                 id,
                 pageCount,
                 elapsed,
+                pagesPerSecond,
                 byNode);
 
             var last = new ClusterLastJobHealth
@@ -668,7 +697,11 @@ public sealed class ClusterCoordinator : IHostedService
                 await ProbeOnceAsync(ct).ConfigureAwait(false);
                 DateTimeOffset now = DateTimeOffset.UtcNow;
                 foreach (ClusterJob job in _jobs.Values)
+                {
                     job.Scheduler.Reap(now);
+                    LogExpiries(job);
+                    MaybeLogProgress(job);
+                }
             }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -718,6 +751,66 @@ public sealed class ClusterCoordinator : IHostedService
             foreach (ClusterJob job in _jobs.Values)
                 job.Scheduler.DropNode(remote.NodeId, DateTimeOffset.UtcNow);
         }
+    }
+
+    private void LogClaim(string jobId, string nodeId, ClusterClaim claim)
+    {
+        if (claim.Kind != ClusterClaimKind.Batch)
+            return;
+        ClusterJobLog.Claim(
+            _logger,
+            _config.VerboseDispatch,
+            jobId,
+            nodeId,
+            claim.BatchId,
+            string.Join(",", claim.Pages),
+            claim.Speculative,
+            claim.LeaseMs);
+    }
+
+    private void LogExpiries(ClusterJob job)
+    {
+        foreach (ClusterLeaseExpiry expiry in job.Scheduler.DrainExpiries())
+        {
+            string pages = expiry.Pages.Length == 0 ? "(none)" : string.Join(",", expiry.Pages);
+            ClusterJobLog.LeaseExpired(_logger, job.Id, expiry.NodeId, expiry.BatchId, pages, expiry.Speculative);
+        }
+    }
+
+    private void MaybeLogProgress(ClusterJob job)
+    {
+        if (job.IsFinished)
+            return;
+        lock (job.ProgressGate)
+            MaybeLogProgressCore(job);
+    }
+
+    private void MaybeLogProgressCore(ClusterJob job)
+    {
+        ClusterScheduleSnapshot snap = job.Scheduler.Snapshot();
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        ClusterJobLog.ProgressDecision decision = ClusterJobLog.EvaluateProgress(
+            snap.Done,
+            job.PageCount,
+            job.Started,
+            job.LastProgressDone,
+            job.LastProgressBucket,
+            job.LastProgressAt,
+            now);
+        if (!decision.Log)
+            return;
+        job.LastProgressDone = snap.Done;
+        job.LastProgressBucket = decision.Bucket;
+        job.LastProgressAt = now;
+        ClusterJobLog.Progress(
+            _logger,
+            job.Id,
+            snap.Done,
+            job.PageCount,
+            decision.Percent,
+            decision.PagesPerSecond,
+            snap.LeasedPages,
+            ClusterJobLog.FormatByNode(snap));
     }
 
     private void AddAuth(HttpRequestMessage req)

@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using MiniOcr.Models;
 using MiniOcr.Services;
 
@@ -86,6 +87,7 @@ AssertTrue(on.Enabled && on.IsWorker && !on.IsCoordinator, "env role worker");
 AssertTrue(on.Token == "s3cret" && on.NodeId == "mac-1", "env token and node id");
 AssertTrue(on.Workers.Count == 2 && on.Workers[0].Url == "http://10.0.0.2:5081", "env worker list trimmed");
 AssertTrue(on.Capacity == 3 && on.PagesPerBatch == 5 && on.JoinGraceMs == 2500, "numeric env overrides");
+AssertTrue(!on.VerboseDispatch, "verbose dispatch stays off when unset");
 AssertTrue(on.EffectiveCapacity(8, 32, llmMode: false) == 3, "explicit capacity wins over engines");
 AssertTrue(
     ClusterRuntimeConfig.Resolve(new AppConfigFile(), _ => null).EffectiveCapacity(0, 32, llmMode: true) == 32,
@@ -154,6 +156,10 @@ Console.WriteLine("=== expired lease is retried by another node ===");
     ClusterClaim retry = sched.Claim("live", 3, now.AddMilliseconds(leased.LeaseMs + 1));
     AssertTrue(retry.Kind == ClusterClaimKind.Batch, "after expiry the other node gets the pages");
     AssertTrue(retry.Pages.OrderBy(p => p).SequenceEqual(leased.Pages.OrderBy(p => p)), "same pages retried");
+    ClusterLeaseExpiry[] expired = sched.DrainExpiries();
+    AssertTrue(expired.Length == 1 && expired[0].NodeId == "dead", "expiry recorded for the dead lease");
+    AssertTrue(expired[0].Pages.OrderBy(p => p).SequenceEqual(leased.Pages.OrderBy(p => p)), "requeued pages match the expired lease");
+    AssertTrue(sched.DrainExpiries().Length == 0, "expiry buffer is cleared");
     CommitAll(sched, retry);
     AssertTrue(sched.IsComplete, "job completes on the retry node");
     AssertTrue(!sched.TryCommit(leased.BatchId, leased.Pages[0]), "late owner cannot overwrite");
@@ -263,6 +269,175 @@ Console.WriteLine("=== NER groups stay in document order when OCR finishes out o
     AssertTrue(!emitted[0].Text.Contains("--- page 11 ---", StringComparison.Ordinal), "later pages are not pulled forward");
 }
 
+Console.WriteLine("=== verboseDispatch config ===");
+{
+    ClusterRuntimeConfig fromEnv = ClusterRuntimeConfig.Resolve(
+        new AppConfigFile
+        {
+            Cluster = new ClusterFileConfig { Enabled = true, Token = "t", VerboseDispatch = false },
+        },
+        name => name == "MINIOCR_CLUSTER_VERBOSE_DISPATCH" ? "1" : null);
+    AssertTrue(fromEnv.VerboseDispatch, "MINIOCR_CLUSTER_VERBOSE_DISPATCH=1");
+    ClusterRuntimeConfig fromFile = ClusterRuntimeConfig.Resolve(
+        new AppConfigFile { Cluster = new ClusterFileConfig { VerboseDispatch = true } },
+        _ => null);
+    AssertTrue(fromFile.VerboseDispatch, "file verboseDispatch true");
+    ClusterRuntimeConfig envOff = ClusterRuntimeConfig.Resolve(
+        new AppConfigFile { Cluster = new ClusterFileConfig { VerboseDispatch = true } },
+        name => name == "MINIOCR_CLUSTER_VERBOSE_DISPATCH" ? "off" : null);
+    AssertTrue(!envOff.VerboseDispatch, "env off overrides file");
+}
+
+Console.WriteLine("=== dispatch log level (before/after at Information) ===");
+{
+    const string jobId = "job-demo";
+    const int total = 24;
+    ClusterPageScheduler sched = NewScheduler(total, expectedNodes: 2, pagesPerBatch: 2, tail: 4, leaseFloorMs: 20_000);
+    sched.SetCapacity("coord", 2);
+    sched.SetCapacity("worker-a", 2);
+    DateTimeOffset started = new(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+    DateTimeOffset now = started;
+    var before = new List<string>();
+    var afterLines = new List<(LogLevel Level, string Text)>();
+    var after = new MemoryLogger(afterLines, LogLevel.Information);
+    int lastDone = 0;
+    int lastBucket = 0;
+    DateTimeOffset lastAt = started;
+    string[] nodes = ["coord", "worker-a"];
+    int turn = 0;
+    int guard = 0;
+    while (!sched.IsComplete && guard++ < 80)
+    {
+        string node = nodes[turn++ % nodes.Length];
+        ClusterClaim claim = sched.Claim(node, 2, now);
+        if (claim.Kind != ClusterClaimKind.Batch)
+            break;
+        string pages = string.Join(",", claim.Pages);
+        before.Add(
+            "info: Cluster job " + jobId + " claim node=" + node + " batch=" + claim.BatchId +
+            " pages=" + pages + " speculative=" + claim.Speculative + " leaseMs=" + claim.LeaseMs);
+        before.Add(
+            "info: Cluster worker " + node + " job " + jobId + " batch " + claim.BatchId +
+            " done pages=" + claim.Pages.Length);
+        ClusterJobLog.Claim(after, verbose: false, jobId, node, claim.BatchId, pages, claim.Speculative, claim.LeaseMs);
+        ClusterJobLog.BatchDone(after, verbose: false, node, jobId, claim.BatchId, claim.Pages.Length);
+        ClusterJobLog.Heartbeat(after, verbose: false, node, 0, 2);
+        ClusterJobLog.DispatchWait(after, verbose: false, node);
+        foreach (int page in claim.Pages)
+            sched.TryCommit(claim.BatchId, page);
+        ClusterScheduleSnapshot snap = sched.Snapshot();
+        ClusterJobLog.ProgressDecision decision = ClusterJobLog.EvaluateProgress(
+            snap.Done, total, started, lastDone, lastBucket, lastAt, now);
+        if (decision.Log)
+        {
+            ClusterJobLog.Progress(
+                after, jobId, snap.Done, total, decision.Percent, decision.PagesPerSecond,
+                snap.LeasedPages, ClusterJobLog.FormatByNode(snap));
+            lastDone = snap.Done;
+            lastBucket = decision.Bucket;
+            lastAt = now;
+        }
+
+        now = now.AddSeconds(1);
+    }
+
+    ClusterScheduleSnapshot finalSnap = sched.Snapshot();
+    double elapsedMs = (now - started).TotalMilliseconds;
+    after.Log(
+        LogLevel.Information,
+        new EventId(0),
+        "Cluster job " + jobId + " done: pages=" + total + " elapsedMs=" + elapsedMs.ToString("F0") +
+        " " + (total / Math.Max(0.001, elapsedMs / 1000.0)).ToString("F1") + " pages/s byNode=" +
+        ClusterJobLog.FormatByNode(finalSnap),
+        null,
+        static (state, _) => state);
+
+    DateTimeOffset t0 = new(2026, 6, 1, 0, 0, 0, TimeSpan.Zero);
+    var early = ClusterJobLog.EvaluateProgress(1, 100, t0, 0, 0, t0, t0.AddMilliseconds(200));
+    AssertTrue(!early.Log, "progress min gap holds");
+    var step = ClusterJobLog.EvaluateProgress(10, 100, t0, 0, 0, t0, t0.AddSeconds(1));
+    AssertTrue(step.Log && step.Percent == 10, "10% step logs after the min gap");
+    var finished = ClusterJobLog.EvaluateProgress(100, 100, t0, 90, 9, t0, t0.AddSeconds(5));
+    AssertTrue(!finished.Log, "100% is the final byNode line, not another progress line");
+
+    AssertTrue(sched.IsComplete, "demo job completed");
+    AssertTrue(before.Count >= 12, "before sample is a per-claim flood (" + before.Count + " lines)");
+    int infoAfter = afterLines.Count(l => l.Level == LogLevel.Information);
+    AssertTrue(infoAfter > 0 && infoAfter < before.Count, "after Information lines are fewer (" + infoAfter + " < " + before.Count + ")");
+    AssertTrue(
+        !afterLines.Any(l => l.Text.Contains(" claim node=", StringComparison.Ordinal)),
+        "default Information has no per-claim line");
+    AssertTrue(
+        !afterLines.Any(l => l.Text.Contains("done pages=", StringComparison.Ordinal)),
+        "default Information has no per-batch done line");
+    AssertTrue(afterLines.Any(l => l.Text.Contains("progress:", StringComparison.Ordinal)), "progress summary is Information");
+    AssertTrue(afterLines.Any(l => l.Text.Contains("byNode=", StringComparison.Ordinal)), "final breakdown stays Information");
+    AssertTrue(!afterLines.Any(l => l.Text.Contains("heartbeat", StringComparison.Ordinal)), "heartbeat hidden at Information");
+    AssertTrue(!afterLines.Any(l => l.Text.Contains("dispatch poll", StringComparison.Ordinal)), "empty poll hidden at Information");
+
+    ClusterPageScheduler tail = NewScheduler(2, expectedNodes: 1, pagesPerBatch: 2, tail: 2, leaseFloorMs: 30_000);
+    tail.SetCapacity("slow", 2);
+    tail.SetCapacity("idle", 2);
+    _ = tail.Claim("slow", 2, t0);
+    ClusterClaim copy = tail.Claim("idle", 2, t0);
+    AssertTrue(copy.Speculative, "demo speculative claim");
+    ClusterJobLog.Claim(after, verbose: false, jobId, "idle", copy.BatchId, string.Join(",", copy.Pages), copy.Speculative, copy.LeaseMs);
+
+    ClusterPageScheduler dead = NewScheduler(2, pagesPerBatch: 2, leaseFloorMs: 1_000, pageTimeoutMs: 1_000);
+    dead.SetCapacity("dead", 2);
+    dead.SetCapacity("live", 2);
+    ClusterClaim held = dead.Claim("dead", 2, t0);
+    _ = dead.Claim("live", 2, t0.AddMilliseconds(held.LeaseMs + 1));
+    foreach (ClusterLeaseExpiry exp in dead.DrainExpiries())
+    {
+        ClusterJobLog.LeaseExpired(
+            after,
+            jobId,
+            exp.NodeId,
+            exp.BatchId,
+            exp.Pages.Length == 0 ? "(none)" : string.Join(",", exp.Pages),
+            exp.Speculative);
+    }
+
+    AssertTrue(
+        afterLines.Any(l => l.Level == LogLevel.Information && l.Text.Contains("speculative retry", StringComparison.Ordinal)),
+        "speculative retry stays Information");
+    AssertTrue(
+        afterLines.Any(l => l.Level == LogLevel.Information && l.Text.Contains("lease expired", StringComparison.Ordinal)),
+        "lease expiry stays Information");
+
+    var verboseLines = new List<(LogLevel Level, string Text)>();
+    var verbose = new MemoryLogger(verboseLines, LogLevel.Information);
+    ClusterJobLog.Claim(verbose, verbose: true, jobId, "coord", "b1", "1,2", speculative: false, leaseMs: 20_000);
+    ClusterJobLog.Heartbeat(verbose, verbose: true, "coord", 2, 2);
+    ClusterJobLog.DispatchWait(verbose, verbose: true, "worker-a");
+    ClusterJobLog.BatchDone(verbose, verbose: true, "worker-a", jobId, "b1", 2);
+    AssertTrue(
+        verboseLines.Count == 4 && verboseLines.All(l => l.Level == LogLevel.Information),
+        "verboseDispatch promotes routine lines to Information");
+
+    var debugLines = new List<(LogLevel Level, string Text)>();
+    var debug = new MemoryLogger(debugLines, LogLevel.Debug);
+    ClusterJobLog.Claim(debug, verbose: false, jobId, "coord", "b1", "1,2", speculative: false, leaseMs: 20_000);
+    ClusterJobLog.Heartbeat(debug, verbose: false, "coord", 0, 2);
+    ClusterJobLog.DispatchWait(debug, verbose: false, "worker-a");
+    AssertTrue(
+        debugLines.Count == 3 && debugLines.All(l => l.Level == LogLevel.Debug),
+        "Logging:LogLevel Debug shows routine dispatch lines");
+
+    Console.WriteLine("--- before: default Information (previous per-claim / per-batch lines) ---");
+    foreach (string line in before)
+        Console.WriteLine(line);
+    Console.WriteLine("--- after: default Information ---");
+    foreach ((LogLevel level, string text) in afterLines)
+    {
+        if (level >= LogLevel.Information)
+            Console.WriteLine(level.ToString().ToLowerInvariant() + ": " + text);
+    }
+
+    Console.WriteLine("--- suppressed at Information: " + before.Count + " routine lines; progress, speculative retry, and lease expiry kept ---");
+}
+
 if (failed > 0)
 {
     Console.WriteLine($"FAILED {failed}");
@@ -271,3 +446,39 @@ if (failed > 0)
 
 Console.WriteLine("ALL PASSED");
 return 0;
+
+sealed class MemoryLogger : ILogger
+{
+    private readonly List<(LogLevel Level, string Text)> _lines;
+    private readonly LogLevel _min;
+
+    public MemoryLogger(List<(LogLevel Level, string Text)> lines, LogLevel min)
+    {
+        _lines = lines;
+        _min = min;
+    }
+
+    public IDisposable BeginScope<TState>(TState state) where TState : notnull => NullScope.Instance;
+
+    public bool IsEnabled(LogLevel logLevel) => logLevel >= _min;
+
+    public void Log<TState>(
+        LogLevel logLevel,
+        EventId eventId,
+        TState state,
+        Exception? exception,
+        Func<TState, Exception?, string> formatter)
+    {
+        if (!IsEnabled(logLevel))
+            return;
+        _lines.Add((logLevel, formatter(state, exception)));
+    }
+
+    private sealed class NullScope : IDisposable
+    {
+        public static readonly NullScope Instance = new();
+        public void Dispose()
+        {
+        }
+    }
+}
