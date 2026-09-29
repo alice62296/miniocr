@@ -217,21 +217,6 @@ OcrPageResult huge = new() { Page = 2, Text = new string('丙', 200) };
 List<LlmPageGrouper.PageBatch> truncated = LlmPageGrouper.BuildGroups([huge], 10, 40);
 AssertTrue(truncated.Count == 1 && truncated[0].PageNumbers is [2] && truncated[0].Text.Length == 40, "oversized page truncated and sent alone");
 
-List<OcrPageResult> overlapPages = [];
-for (int i = 1; i <= 25; i++)
-    overlapPages.Add(new OcrPageResult { Page = i, Text = "页" + i });
-List<LlmPageGrouper.PageBatch> overlapped = LlmPageGrouper.BuildGroups(overlapPages, pagesPerRequest: 10, maxChars: 300_000, overlap: 1);
-AssertTrue(overlapped.Count == 3, $"25 pages overlap 1 → 3 groups, got {overlapped.Count}");
-AssertTrue(overlapped[0].PageNumbers.SequenceEqual(Enumerable.Range(1, 10)), "overlap group1 is 1..10");
-AssertTrue(overlapped[1].PageNumbers[0] == 10 && overlapped[1].PageNumbers[^1] == 19 && overlapped[1].PageNumbers.Length == 10, "overlap group2 is 10..19");
-AssertTrue(overlapped[2].PageNumbers[0] == 19 && overlapped[2].PageNumbers[^1] == 25, "overlap group3 starts at the carried page");
-
-List<OcrPageResult> exactTen = [];
-for (int i = 1; i <= 10; i++)
-    exactTen.Add(new OcrPageResult { Page = i, Text = "页" + i });
-List<LlmPageGrouper.PageBatch> noTail = LlmPageGrouper.BuildGroups(exactTen, 10, 300_000, overlap: 1);
-AssertTrue(noTail.Count == 1 && noTail[0].PageNumbers.Length == 10, "exact multiple does not re-send the overlap suffix");
-
 LlmPageGrouper.OrderedBuffer buffer = new(5, pagesPerRequest: 2, maxChars: 100_000);
 AssertTrue(buffer.Add(new OcrPageResult { Page = 2, Text = "乙" }).Count == 0, "out-of-order page 2 waits for page 1");
 List<LlmPageGrouper.PageBatch> firstReady = buffer.Add(new OcrPageResult { Page = 1, Text = "甲" });

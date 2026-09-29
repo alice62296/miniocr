@@ -10,12 +10,6 @@ namespace MiniOcr.Services;
 /// order — not a fixed page-number window — so original page numbers stay on
 /// the <c>--- page N ---</c> markers. A group is split early when the next
 /// page would exceed <c>maxChars</c>.
-/// <para>
-/// <c>overlap</c> repeats the last non-empty pages of a full group at the start
-/// of the next group so a name cut by the group boundary is still visible.
-/// Overlap is clamped to <c>pagesPerRequest - 1</c>. The final partial group
-/// is not emitted again when it is only that carried suffix.
-/// </para>
 /// </summary>
 public static class LlmPageGrouper
 {
@@ -33,18 +27,16 @@ public static class LlmPageGrouper
     public static List<PageBatch> BuildGroups(
         IReadOnlyList<OcrPageResult> pages,
         int pagesPerRequest,
-        int maxChars,
-        int overlap = 0)
+        int maxChars)
     {
         pagesPerRequest = Math.Max(1, pagesPerRequest);
         maxChars = Math.Max(1, maxChars);
-        overlap = ClampOverlap(overlap, pagesPerRequest);
         List<PageBatch> batches = [];
         List<OcrPageResult> pending = [];
         int pendingChars = 0;
         foreach (OcrPageResult page in pages)
-            Accept(page, pagesPerRequest, maxChars, overlap, pending, ref pendingChars, batches, nonEmpty: null);
-        FlushRemainder(pending, batches);
+            Accept(page, pagesPerRequest, maxChars, pending, ref pendingChars, batches, nonEmpty: null);
+        FlushPending(pending, batches);
         return batches;
     }
 
@@ -57,20 +49,18 @@ public static class LlmPageGrouper
         private readonly OcrPageResult?[] _slots;
         private readonly int _pagesPerRequest;
         private readonly int _maxChars;
-        private readonly int _overlap;
         private readonly List<OcrPageResult> _pending = [];
         private readonly List<OcrPageResult> _nonEmpty = [];
         private int _pendingChars;
         private int _next;
 
-        public OrderedBuffer(int pageCount, int pagesPerRequest, int maxChars, int overlap = 0)
+        public OrderedBuffer(int pageCount, int pagesPerRequest, int maxChars)
         {
             if (pageCount < 0)
                 throw new ArgumentOutOfRangeException(nameof(pageCount));
             _slots = new OcrPageResult?[pageCount];
             _pagesPerRequest = Math.Max(1, pagesPerRequest);
             _maxChars = Math.Max(1, maxChars);
-            _overlap = ClampOverlap(overlap, _pagesPerRequest);
         }
 
         public IReadOnlyList<OcrPageResult> NonEmptyPages => _nonEmpty;
@@ -107,7 +97,7 @@ public static class LlmPageGrouper
                 Drain(ready);
             }
 
-            LlmPageGrouper.FlushRemainder(_pending, ready);
+            FlushPending(_pending, ready);
             _pendingChars = 0;
             return ready;
         }
@@ -119,19 +109,15 @@ public static class LlmPageGrouper
                 OcrPageResult page = _slots[_next]!;
                 _slots[_next] = null;
                 _next++;
-                Accept(page, _pagesPerRequest, _maxChars, _overlap, _pending, ref _pendingChars, ready, _nonEmpty);
+                Accept(page, _pagesPerRequest, _maxChars, _pending, ref _pendingChars, ready, _nonEmpty);
             }
         }
     }
-
-    private static int ClampOverlap(int overlap, int pagesPerRequest) =>
-        Math.Clamp(overlap, 0, Math.Max(0, pagesPerRequest - 1));
 
     private static void Accept(
         OcrPageResult page,
         int pagesPerRequest,
         int maxChars,
-        int overlap,
         List<OcrPageResult> pending,
         ref int pendingChars,
         List<PageBatch> emitted,
@@ -144,8 +130,7 @@ public static class LlmPageGrouper
         string chunk = FormatPage(page);
         if (pending.Count > 0 && pendingChars + chunk.Length > maxChars)
         {
-            // A carried overlap page must not block the next page forever.
-            FlushPending(pending, emitted, overlap: 0);
+            FlushPending(pending, emitted);
             pendingChars = 0;
         }
 
@@ -158,18 +143,16 @@ public static class LlmPageGrouper
         pending.Add(page);
         pendingChars += chunk.Length;
         if (pending.Count >= pagesPerRequest)
-            pendingChars = FlushPending(pending, emitted, overlap);
+        {
+            FlushPending(pending, emitted);
+            pendingChars = 0;
+        }
     }
 
-    /// <summary>
-    /// Emits <paramref name="pending"/> and, when <paramref name="overlap"/> is
-    /// positive, leaves that many trailing pages in <paramref name="pending"/>
-    /// for the next group. Returns the character count of what remains.
-    /// </summary>
-    private static int FlushPending(List<OcrPageResult> pending, List<PageBatch> emitted, int overlap)
+    private static void FlushPending(List<OcrPageResult> pending, List<PageBatch> emitted)
     {
         if (pending.Count == 0)
-            return 0;
+            return;
 
         StringBuilder sb = new();
         int[] nums = new int[pending.Count];
@@ -180,47 +163,6 @@ public static class LlmPageGrouper
         }
 
         emitted.Add(new PageBatch(sb.ToString(), nums));
-
-        if (overlap <= 0 || pending.Count <= overlap)
-        {
-            pending.Clear();
-            return 0;
-        }
-
-        pending.RemoveRange(0, pending.Count - overlap);
-        int chars = 0;
-        for (int i = 0; i < pending.Count; i++)
-            chars += FormatPage(pending[i]).Length;
-        return chars;
-    }
-
-    private static void FlushRemainder(List<OcrPageResult> pending, List<PageBatch> emitted)
-    {
-        if (pending.Count == 0)
-            return;
-        if (AlreadyEmitted(emitted, pending))
-        {
-            pending.Clear();
-            return;
-        }
-
-        FlushPending(pending, emitted, overlap: 0);
-    }
-
-    private static bool AlreadyEmitted(List<PageBatch> emitted, List<OcrPageResult> pending)
-    {
-        if (emitted.Count == 0 || pending.Count == 0)
-            return false;
-        int[] last = emitted[^1].PageNumbers;
-        if (pending.Count > last.Length)
-            return false;
-        int offset = last.Length - pending.Count;
-        for (int i = 0; i < pending.Count; i++)
-        {
-            if (last[offset + i] != pending[i].Page)
-                return false;
-        }
-
-        return true;
+        pending.Clear();
     }
 }

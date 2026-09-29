@@ -239,7 +239,6 @@ cd artifacts/linux-x64-singlefile
     "timeoutSeconds": 120,
     "maxCharsPerRequest": 300000,
     "pagesPerRequest": 10,
-    "pageGroupOverlap": 1,
     "maxConcurrency": 8,
     "ocrConcurrency": 32,
     "ocrMaxCharsHint": 8000,
@@ -343,7 +342,7 @@ cd artifacts/linux-x64-singlefile
    - 本地（如 Ollama 兼容层）：`http://127.0.0.1:11434` + 你的视觉模型名
 4. 或仅用环境变量：`export MINIOCR_LLM_API_KEY=sk-...`（其余仍可读文件）。
 5. **文本 NER 并发**：`llm.maxConcurrency`（默认 **8**，范围 1–32）用于 `local` 模式下的 Chat Completions 批次；`MINIOCR_LLM_MAX_CONCURRENCY` 可覆盖。
-6. **文本 NER 分页**：`llm.pagesPerRequest`（默认 **10**，范围 1–2000）表示每个请求包含的**非空** OCR 页数；`MINIOCR_LLM_PAGES_PER_REQUEST` 可覆盖。空白页不占名额、不发请求。相邻两组默认再重叠 **1** 个非空页（`llm.pageGroupOverlap`，0–5，`MINIOCR_LLM_PAGE_GROUP_OVERLAP`），避免公司名正好被组边界切开。重叠页只是在下一组提示词里再出现一次；合并时按名字去重，`count` 不会因此翻倍。设为 `0` 即恢复不重叠。每组仍大约 10 页，2000 页的请求数大约增加一成。
+6. **文本 NER 分页**：`llm.pagesPerRequest`（默认 **10**，范围 1–2000）表示每个请求包含的**非空** OCR 页数；`MINIOCR_LLM_PAGES_PER_REQUEST` 可覆盖。空白页不占名额、不发请求。分组是连续、互不重叠的非空页。
 7. **视觉 OCR 并发**：`llm.ocrConcurrency`（默认 **32**，1–256）；`MINIOCR_LLM_OCR_CONCURRENCY` 可覆盖。调高可缩短墙钟时间，但请留意 **费率与限流**。
 8. **视觉 JPEG 质量**：`llm.ocrJpegQuality`（默认 **70**，40–95）；`MINIOCR_LLM_OCR_JPEG_QUALITY` 可覆盖。
 9. **`maxCharsPerRequest`（安全上限）**：默认 **300000**（钳制 1000–2_000_000）。分组以 `pagesPerRequest` 为准；若下一页会让当前组超过该字符数，则提前拆组。单页超限时截断后单独发送。
@@ -364,7 +363,6 @@ cd artifacts/linux-x64-singlefile
 | `MINIOCR_WECHAT_INSTANCES` | `ocr.wechatInstances` | `Clamp(核数/4, 1, 3)` | 微信 OCR **进程**数。每个进程同时只跑一页 |
 | `MINIOCR_WECHAT_FALLBACK` | `ocr.wechatFallbackToLocal` | **true** | `0/false` 时找不到插件就退出，不回退 Paddle |
 | `MINIOCR_LLM_PAGES_PER_REQUEST` | `llm.pagesPerRequest` | **10**（1–2000） | `local` 文本 NER：每个请求的非空页数 |
-| `MINIOCR_LLM_PAGE_GROUP_OVERLAP` | `llm.pageGroupOverlap` | **1**（0–5） | 相邻 NER 组重叠的非空页数；实际不会超过 `pagesPerRequest-1` |
 | `MINIOCR_LLM_OCR_CONCURRENCY` | `llm.ocrConcurrency` | **32**（1–256） | `ocr.mode=llm` 时页级视觉并发 |
 | `MINIOCR_LLM_OCR_JPEG_QUALITY` | `llm.ocrJpegQuality` | **70**（40–95） | `ocr.mode=llm` 时页图 JPEG 质量（更低=更快编码/更小上传） |
 | `MINIOCR_LLM_THINKING` | `llm.thinking` | **false**（disabled） | DeepSeek 思考模式；`0/1/false/true/disabled/enabled`；默认关闭并显式发送 `thinking.type=disabled` |
@@ -484,7 +482,7 @@ curl -sS http://127.0.0.1:5080/health
 
 `local` 模式在 OCR 进行中就开始抽取，不必等全书结束：
 
-1. **LLM（推荐，`local` 模式文本 NER）**：若 `llm.enabled` 且配置了 `apiKey`，按 **非空页** 分组。默认每 **10** 个有文字的页组成一个请求（`llm.pagesPerRequest`，范围 1–2000），空白页（OCR 文本为空或只有空白）**不发给 LLM**，也**不出现在协议输出的 `pages` 里**。分组按文档顺序累计非空页，而不是固定的「第 1–10 页 / 11–20 页」窗口——这样空白页不会占掉名额，也不会产生整组为空的请求。页码仍写在提示词的 `--- page N ---` 里，N 是 PDF 原页码。满一组之后，默认把最后 **1** 页带到下一组（`pageGroupOverlap`），避免名字被组边界切断。某一组若再加一页就会超过 `maxCharsPerRequest`（默认 **300000**），则提前拆开（这种按字数拆开的边界不做重叠）；单页超限则截断后单独发送。请求在凑满一组时就发出（与后续 OCR 重叠），在途请求数不超过 `maxConcurrency`（默认 **8**）。提示词要求只返回严格 JSON `{"companies":["..."],"persons":["..."]}`，并写明什么算人名、什么算公司、如何把 OCR 拆开的汉字接回去。各批结果合并后做后处理：全角 ASCII 折成半角、去掉汉字之间的空白、丢掉对不上原文的幻觉、丢掉「张某」这类脱敏名和法院/政府机关、简称并进法定全称（分公司/分行仍单独保留），再回扫各非空页填充 `count` / `originText`。名字在页边界被拆开时，会看下一非空页开头 240 字。
+1. **LLM（推荐，`local` 模式文本 NER）**：若 `llm.enabled` 且配置了 `apiKey`，按 **非空页** 分组。默认每 **10** 个有文字的页组成一个请求（`llm.pagesPerRequest`，范围 1–2000），空白页（OCR 文本为空或只有空白）**不发给 LLM**，也**不出现在协议输出的 `pages` 里**。分组按文档顺序累计非空页，而不是固定的「第 1–10 页 / 11–20 页」窗口——这样空白页不会占掉名额，也不会产生整组为空的请求。页码仍写在提示词的 `--- page N ---` 里，N 是 PDF 原页码。某一组若再加一页就会超过 `maxCharsPerRequest`（默认 **300000**），则提前拆开；单页超限则截断后单独发送。请求在凑满一组时就发出（与后续 OCR 重叠），在途请求数不超过 `maxConcurrency`（默认 **8**）。提示词要求只返回严格 JSON `{"companies":["..."],"persons":["..."]}`，并写明什么算人名、什么算公司、如何把 OCR 拆开的汉字接回去。各批结果合并后做后处理：全角 ASCII 折成半角、去掉汉字之间的空白、丢掉对不上原文的幻觉、丢掉「张某」这类脱敏名和法院/政府机关、简称并进法定全称（分公司/分行仍单独保留），再回扫各非空页填充 `count` / `originText`。名字在页边界被拆开时，会看下一非空页开头 240 字。
 2. **LLM 已调用后**：失败或结果为空时 **不**再回退 `EntityExtractor` 启发式——记错误日志并返回空 `entities`（避免静默启发式人名/公司名污染竞赛结果）。
 3. **仅当 LLM 未启用 / 无 key**：若显式 `fallbackToHeuristics: true`，才使用 `EntityExtractor`（Regex + 百家姓 HashSet，`[GeneratedRegex]`，无 ML 包，AOT 安全）；默认 **false** → 空实体。空白页同样不进入协议输出。
 4. **`ocr.mode=llm`（视觉）**：实体来自页级结构化 `ruleList`（及兼容的 companies/persons 字段），**不用**启发式 invent。视觉调用仍是一页一次（送出前无法知道该页有没有字）。返回文本为空且没有 `ruleList` 的页会从输出中去掉。
@@ -624,7 +622,7 @@ The current CPU is missing one or more of the required instruction sets.
 | 下载 | `HttpClient`：若 `Accept-Ranges: bytes` 且已知 `Content-Length`，则并行 Range 写入预分配缓冲；否则单流写入预分配/可控增长缓冲。硬顶 **300 MB**。缓冲来自 `ArrayPool<byte>`。 |
 | 栅格化 | PDFtoImage（PDFium + SkiaSharp）；**local** 默认 **96 DPI**，**llm** 未显式配置时默认 **72 DPI**；每 worker **一次** `PdfDocument.Load` + `ToImages`；`AntiAliasing=None` + `Grayscale`；多生产者写入有界 Channel，**绝不**同时持有全部页位图。llm 默认更多 raster workers（`min(8,cores)`）。 |
 | OCR | **local**：复用多个 `PaddleOcrAll`（ChineseV6Tiny，默认可关 CLS）；页级引擎池互斥租用；Channel 上 raster↔OCR 重叠。**llm**：不加载 Paddle；**每页** JPEG（质量默认 70）经有界队列立刻交给视觉 worker（`ocrConcurrency`），与栅格重叠——不再等全本编码完才发第一张；优先直接产出 B04/B06 `ruleList`。 |
-| 实体 | 优先 `LlmEntityExtractor`：每 10 个非空页一组 JSON NER（默认重叠 1 页），OCR 未结束即可发出，`maxConcurrency` 并行；空白页不发送、不出现在输出。回来后按原文对齐、过滤非公司/脱敏名并合并简称。失败/关闭则 `EntityExtractor` 启发式。 |
+| 实体 | 优先 `LlmEntityExtractor`：每 10 个非空页一组 JSON NER，OCR 未结束即可发出，`maxConcurrency` 并行；空白页不发送、不出现在输出。回来后按原文对齐、过滤非公司/脱敏名并合并简称。失败/关闭则 `EntityExtractor` 启发式。 |
 | JSON | 源生成 `AppJsonContext`，AOT 友好。 |
 
 ### 峰值内存（量级，非承诺值）
