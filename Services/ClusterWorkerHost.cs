@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
@@ -136,7 +137,7 @@ public sealed class ClusterWorkerHost : IHostedService
             return false;
         }
 
-        StartSession(req.JobId.Trim(), req.CoordinatorUrl.Trim().TrimEnd('/'), req.Dpi);
+        StartSession(req.JobId.Trim(), req.CoordinatorUrl.Trim().TrimEnd('/'), req.Dpi, req.PageCount);
         return true;
     }
 
@@ -165,7 +166,9 @@ public sealed class ClusterWorkerHost : IHostedService
                 {
                     ClusterDispatchResponse? dispatch = await DispatchAsync(ct).ConfigureAwait(false);
                     if (dispatch is { Wait: false, JobId.Length: > 0, PdfPath.Length: > 0 })
-                        StartSession(dispatch.JobId, _config.CoordinatorUrl, dispatch.Dpi);
+                        StartSession(dispatch.JobId, _config.CoordinatorUrl, dispatch.Dpi, dispatch.PageCount);
+                    else
+                        ClusterJobLog.DispatchWait(_logger, _config.VerboseDispatch, _self.NodeId);
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
@@ -192,7 +195,7 @@ public sealed class ClusterWorkerHost : IHostedService
         }
     }
 
-    private void StartSession(string jobId, string coordinatorUrl, int dpi)
+    private void StartSession(string jobId, string coordinatorUrl, int dpi, int pageCount)
     {
         var sessionCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
         if (!_sessions.TryAdd(jobId, sessionCts))
@@ -201,21 +204,33 @@ public sealed class ClusterWorkerHost : IHostedService
             return;
         }
 
-        _ = Task.Run(() => SessionAsync(jobId, coordinatorUrl, dpi, sessionCts), CancellationToken.None);
+        _ = Task.Run(() => SessionAsync(jobId, coordinatorUrl, dpi, pageCount, sessionCts), CancellationToken.None);
     }
 
-    private async Task SessionAsync(string jobId, string coordinatorUrl, int dpi, CancellationTokenSource sessionCts)
+    private async Task SessionAsync(string jobId, string coordinatorUrl, int dpi, int pageCount, CancellationTokenSource sessionCts)
     {
         CancellationToken ct = sessionCts.Token;
+        int localDone = 0;
+        DateTimeOffset started = DateTimeOffset.UtcNow;
+        DateTimeOffset progressAt = started;
         try
         {
             _logger.LogInformation(
-                "Cluster worker {NodeId} joining job {JobId} via {Coordinator} dpi={Dpi}",
+                "Cluster worker {NodeId} joining job {JobId} via {Coordinator} dpi={Dpi} pages={Pages}",
                 _self.NodeId,
                 jobId,
                 coordinatorUrl,
-                dpi);
+                dpi,
+                pageCount);
+            Stopwatch download = Stopwatch.StartNew();
             byte[] pdf = await DownloadPdfAsync(coordinatorUrl, jobId, ct).ConfigureAwait(false);
+            download.Stop();
+            _logger.LogInformation(
+                "Cluster worker {NodeId} job {JobId} PDF downloaded bytes={Bytes} ms={Ms:F0}",
+                _self.NodeId,
+                jobId,
+                pdf.Length,
+                download.Elapsed.TotalMilliseconds);
             await JoinAsync(coordinatorUrl, jobId, ct).ConfigureAwait(false);
 
             while (!ct.IsCancellationRequested)
@@ -227,6 +242,7 @@ public sealed class ClusterWorkerHost : IHostedService
                     break;
                 if (claim.Wait || claim.Pages is null || claim.Pages.Count == 0 || string.IsNullOrWhiteSpace(claim.BatchId))
                 {
+                    ClusterJobLog.ClaimWait(_logger, _config.VerboseDispatch, _self.NodeId, jobId);
                     await Task.Delay(Math.Clamp(claim.RetryAfterMs, 50, 2000), ct).ConfigureAwait(false);
                     continue;
                 }
@@ -248,12 +264,27 @@ public sealed class ClusterWorkerHost : IHostedService
                         ct).ConfigureAwait(false);
                     await PostResultsAsync(coordinatorUrl, jobId, claim.BatchId, results, ct).ConfigureAwait(false);
                     Interlocked.Add(ref _pagesDone, results.Count);
-                    _logger.LogInformation(
-                        "Cluster worker {NodeId} job {JobId} batch {Batch} done pages={Pages}",
+                    localDone += results.Count;
+                    ClusterJobLog.BatchDone(
+                        _logger,
+                        _config.VerboseDispatch,
                         _self.NodeId,
                         jobId,
                         claim.BatchId,
                         results.Count);
+                    DateTimeOffset now = DateTimeOffset.UtcNow;
+                    if (now - progressAt >= ClusterJobLog.ProgressInterval)
+                    {
+                        double rate = localDone / Math.Max(0.001, (now - started).TotalSeconds);
+                        _logger.LogInformation(
+                            "Cluster worker {NodeId} job {JobId} progress: localPages={Pages} jobPages={Total} {Rate:F1} pages/s",
+                            _self.NodeId,
+                            jobId,
+                            localDone,
+                            pageCount,
+                            rate);
+                        progressAt = now;
+                    }
                 }
                 catch (OperationCanceledException)
                 {
@@ -281,7 +312,11 @@ public sealed class ClusterWorkerHost : IHostedService
         {
             _sessions.TryRemove(jobId, out _);
             sessionCts.Dispose();
-            _logger.LogInformation("Cluster worker {NodeId} left job {JobId}", _self.NodeId, jobId);
+            _logger.LogInformation(
+                "Cluster worker {NodeId} left job {JobId} localPages={Pages}",
+                _self.NodeId,
+                jobId,
+                localDone);
         }
     }
 
@@ -359,6 +394,21 @@ public sealed class ClusterWorkerHost : IHostedService
                     AddAuth(req);
                     req.Content = JsonContent.Create(body, AppJsonContext.Default.ClusterHeartbeatRequest);
                     using HttpResponseMessage resp = await Client().SendAsync(req, ct).ConfigureAwait(false);
+                    if (resp.IsSuccessStatusCode)
+                    {
+                        ClusterJobLog.Heartbeat(
+                            _logger,
+                            _config.VerboseDispatch,
+                            _self.NodeId,
+                            body.InFlight,
+                            body.Capacity);
+                    }
+                    else
+                    {
+                        _logger.LogWarning(
+                            "Cluster heartbeat returned {Status}",
+                            (int)resp.StatusCode);
+                    }
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {

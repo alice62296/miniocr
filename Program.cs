@@ -4,6 +4,14 @@ using MiniOcr.Models;
 using MiniOcr.Services;
 
 WebApplicationBuilder builder = WebApplication.CreateSlimBuilder(args);
+// CreateSlimBuilder ships without the template's appsettings.json, so every
+// cluster HTTP call is Information: hosting "Request starting/finished" plus
+// "Executing endpoint" on the coordinator, and four HttpClient lines per call
+// on the worker. Idle dispatch polls (4 Hz) drown OCR progress. Match the
+// ASP.NET template for Microsoft.AspNetCore, and keep HttpClient at Warning,
+// unless Logging:LogLevel already sets that category.
+QuietFrameworkRequestLogs(builder, "Microsoft.AspNetCore", LogLevel.Warning);
+QuietFrameworkRequestLogs(builder, "System.Net.Http.HttpClient", LogLevel.Warning);
 
 builder.WebHost.ConfigureKestrel(options =>
 {
@@ -252,7 +260,7 @@ if (clusterConfig.Enabled)
         $"Cluster: enabled role={clusterConfig.Role} nodeId={clusterConfig.NodeId} " +
         $"capacity={clusterCapacity} model={clusterModel} dpi={runtimeConfig.DefaultDpi} " +
         $"workers={clusterConfig.Workers.Count} advertise={clusterConfig.AdvertiseUrl} " +
-        $"coordinator={clusterConfig.CoordinatorUrl} token=(set)");
+        $"coordinator={clusterConfig.CoordinatorUrl} verboseDispatch={(clusterConfig.VerboseDispatch ? "on" : "off")} token=(set)");
 }
 else
 {
@@ -774,7 +782,8 @@ app.MapGet("/", () => Results.Text(
     "Env OCR: MINIOCR_OCR_MODE MINIOCR_ENGINES MINIOCR_DPI MINIOCR_LINE_WORKERS MINIOCR_DET_THREADS MINIOCR_USE_CLS MINIOCR_RASTER_WORKERS\n" +
     "Env WECHAT: MINIOCR_WECHAT_OCR_PATH MINIOCR_WECHAT_DIR MINIOCR_WECHAT_INSTANCES MINIOCR_WECHAT_FALLBACK\n" +
     "Env LLM: MINIOCR_LLM_API_KEY MINIOCR_LLM_BASE_URL MINIOCR_LLM_MODEL MINIOCR_LLM_MAX_CONCURRENCY MINIOCR_LLM_PAGES_PER_REQUEST MINIOCR_LLM_OCR_CONCURRENCY MINIOCR_LLM_THINKING\n" +
-    "Env cluster: MINIOCR_CLUSTER_ENABLED MINIOCR_CLUSTER_ROLE MINIOCR_CLUSTER_TOKEN MINIOCR_CLUSTER_NODE_ID MINIOCR_CLUSTER_ADVERTISE_URL MINIOCR_CLUSTER_COORDINATOR_URL MINIOCR_CLUSTER_WORKERS MINIOCR_CLUSTER_CAPACITY\n",
+    "Env cluster: MINIOCR_CLUSTER_ENABLED MINIOCR_CLUSTER_ROLE MINIOCR_CLUSTER_TOKEN MINIOCR_CLUSTER_NODE_ID MINIOCR_CLUSTER_ADVERTISE_URL MINIOCR_CLUSTER_COORDINATOR_URL MINIOCR_CLUSTER_WORKERS MINIOCR_CLUSTER_CAPACITY MINIOCR_CLUSTER_VERBOSE_DISPATCH\n" +
+    "  Each claim, heartbeat, batch completion, and empty poll is Debug unless MINIOCR_CLUSTER_VERBOSE_DISPATCH=1 (or cluster.verboseDispatch). Progress summaries stay Information. Logging__LogLevel__MiniOcr.Services.ClusterCoordinator=Debug (and ClusterWorkerHost) shows the same detail. Per-request framework logs default to Warning; raise Logging__LogLevel__Microsoft.AspNetCore and Logging__LogLevel__System.Net.Http.HttpClient to see them.\n",
     "text/plain; charset=utf-8"));
 
 string urls = string.Join(", ", app.Urls.DefaultIfEmpty("(default http://localhost:5000)"));
@@ -791,6 +800,14 @@ logger.LogInformation(
     llmConfig.IsUsable,
     llmConfig.OcrConcurrency,
     urls);
+
+static void QuietFrameworkRequestLogs(WebApplicationBuilder webBuilder, string category, LogLevel level)
+{
+    string? configured = webBuilder.Configuration["Logging:LogLevel:" + category];
+    if (!string.IsNullOrWhiteSpace(configured))
+        return;
+    webBuilder.Logging.AddFilter(category, level);
+}
 
 static string FirstLine(string message)
 {
