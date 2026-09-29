@@ -435,6 +435,7 @@ public static class AppConfigStore
             "jobDeadlineSeconds": 300,
             "joinGraceMs": 500,
             "speculativeTailPages": 4,
+            "verboseDispatch": false,
             "workers": []
           }
         }

@@ -691,7 +691,7 @@ The current CPU is missing one or more of the required instruction sets.
 7. 到达 `jobDeadlineSeconds`（默认 300）仍有远程租约：协调节点丢弃远程租约，剩下的页只在本地做完。死掉的工人不会让任务挂死或直接失败。
 8. 页按完成顺序写入，但 LLM NER 仍用原来的有序缓冲：凑满**连续的** 10 个非空页就发出一组，空白页不占名额、也不进协议输出。最终每页文本与单机相同（同一模型、同一 DPI）。
 
-`GET /health` 在集群开启时多一个 `cluster` 对象：节点、容量、健康、在途页、累计完成页。每个任务结束时日志有一行 `byNode=coord=.., worker-a=..`，以及 `OCR_TEXT_SHA256=`（全页文本哈希，含空白页，便于和单机对照）。这些都不进竞赛 JSON。
+`GET /health` 在集群开启时多一个 `cluster` 对象：节点、容量、健康、在途页、累计完成页。任务进行中大约每 3 秒或每 10% 有一行进度（`done/total`、pages/s、各节点页数），结束时另有一行 `byNode=coord=.., worker-a=..`，以及 `OCR_TEXT_SHA256=`（全页文本哈希，含空白页，便于和单机对照）。这些都不进竞赛 JSON。调度日志见下面「日志」。
 
 ### 这台开发机上的计时
 
@@ -731,6 +731,7 @@ The current CPU is missing one or more of the required instruction sets.
     "healthIntervalSeconds": 5,
     "jobDeadlineSeconds": 300,
     "speculativeTailPages": 4,
+    "verboseDispatch": false,
     "workers": [
       { "url": "http://192.168.1.30:5081", "capacity": 0 }
     ]
@@ -788,6 +789,37 @@ MiniOcr.exe --urls http://0.0.0.0:5080
 | `MINIOCR_CLUSTER_JOB_DEADLINE_SECONDS` | 到点后本地接管剩余页 |
 | `MINIOCR_CLUSTER_JOIN_GRACE_MS` | 开局留给工人下载 PDF 的本地窗口 |
 | `MINIOCR_CLUSTER_SPECULATIVE_TAIL` | 尾巴投机复制的页数上限 |
+| `MINIOCR_CLUSTER_VERBOSE_DISPATCH` | `1` / `true` 时把领页、心跳、批次完成、空轮询打到 Information。默认关闭（这些行在 Debug） |
+
+### 日志
+
+多机时领页很密。协调节点每次 `claim`、工人每批完成，以前都打在 Information。再加上框架对每一次 HTTP（空转的 `POST /cluster/dispatch` 大约每秒 4 次、心跳、领页、回传）各打多行 Information，控制台就看不见 OCR / NER 了。
+
+默认 Information 保留：
+
+- 任务开始、PDF 下载、渲染 / OCR / NER 的阶段和耗时、任务结束
+- 进度汇总：大约每 3 秒，或每跨过 10%（两次至少隔 1 秒）：`done/total`、pages/s、`byNode=`。结束时仍有一行带 pages/s 的 `byNode=`
+- 工人注册、加入任务、离开任务（离开行带本节点页数）
+- 租约到期后页被重新排队、投机重试
+- 全部 warning / error
+
+改到 Debug 的例行事件（没有任务时的空轮询以前不打应用日志，现在也只在 Debug）：
+
+- 每次领页 / 发放租约
+- 心跳成功
+- 每批完成、协调节点收下一批结果
+- 空的 dispatch / claim 轮询
+
+框架日志：未单独配置时，`Microsoft.AspNetCore`（入站 Request starting / Executing endpoint）和 `System.Net.Http.HttpClient`（出站每个请求四行）降到 Warning。`Microsoft.Hosting.Lifetime` 的监听地址仍是 Information。已经写了 `Logging:LogLevel` 的类别不会被覆盖。
+
+要看回每批调度明细，二选一：
+
+- `cluster.verboseDispatch: true`，或 `MINIOCR_CLUSTER_VERBOSE_DISPATCH=1`（上面的 Debug 行升到 Information，默认日志级别就能看见）
+- 不改这个开关，把类别调到 Debug：`Logging__LogLevel__MiniOcr.Services.ClusterCoordinator=Debug` 和 `Logging__LogLevel__MiniOcr.Services.ClusterWorkerHost=Debug`
+
+要看每条 HTTP：`Logging__LogLevel__Microsoft.AspNetCore=Information` 和 `Logging__LogLevel__System.Net.Http.HttpClient=Information`。
+
+调度和竞赛 JSON 不变。
 
 ### 防火墙和端口
 

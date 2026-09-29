@@ -39,6 +39,16 @@ public sealed class ClusterNodeLoad
     public int InFlight { get; set; }
 }
 
+/// <summary>A lease whose deadline passed. Recorded for logging; does not change scheduling.</summary>
+public sealed class ClusterLeaseExpiry
+{
+    public string BatchId { get; init; } = "";
+    public string NodeId { get; init; } = "";
+    /// <summary>1-based pages returned to the pending queue. Empty when another lease still holds them.</summary>
+    public int[] Pages { get; init; } = [];
+    public bool Speculative { get; init; }
+}
+
 public sealed class ClusterScheduleSnapshot
 {
     public int Done { get; init; }
@@ -70,6 +80,7 @@ public sealed class ClusterPageScheduler
     private readonly Dictionary<string, int> _caps = new(StringComparer.Ordinal);
     private readonly Dictionary<string, int> _committed = new(StringComparer.Ordinal);
     private readonly List<TaskCompletionSource<bool>> _waiters = [];
+    private readonly List<ClusterLeaseExpiry> _expiries = [];
     private int _expectedNodes;
     private int _done;
     private int _batchSeq;
@@ -463,7 +474,34 @@ public sealed class ClusterPageScheduler
         }
 
         foreach (string id in expired)
-            ReleaseCore(id);
+        {
+            if (!_leases.TryGetValue(id, out Lease? lease))
+                continue;
+            string nodeId = lease.NodeId;
+            bool speculative = lease.Speculative;
+            int[] released = ReleaseCore(id);
+            Array.Sort(released);
+            _expiries.Add(new ClusterLeaseExpiry
+            {
+                BatchId = id,
+                NodeId = nodeId,
+                Pages = released,
+                Speculative = speculative,
+            });
+        }
+    }
+
+    /// <summary>Lease-expiry events recorded by <see cref="Reap"/> and by <see cref="Claim"/>. Clears the buffer.</summary>
+    public ClusterLeaseExpiry[] DrainExpiries()
+    {
+        lock (_gate)
+        {
+            if (_expiries.Count == 0)
+                return [];
+            ClusterLeaseExpiry[] copy = _expiries.ToArray();
+            _expiries.Clear();
+            return copy;
+        }
     }
 
     private int[] ReleaseCore(string batchId)
