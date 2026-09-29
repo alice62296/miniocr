@@ -122,5 +122,39 @@ string macPrimary = "/Users/demo/Library/Application Support/MiniOcr/config.json
     AssertEqual(expected, resolved.Path, "win empty AppData → Roaming fallback");
 }
 
+// A config written while pageGroupOverlap existed must still load. The key is ignored.
+{
+    string tmp = Path.Combine(Path.GetTempPath(), "miniocr-legacy-overlap-" + Guid.NewGuid().ToString("N") + ".json");
+    File.WriteAllText(tmp, """
+    {
+      "llm": {
+        "enabled": true,
+        "apiKey": "legacy-key",
+        "pagesPerRequest": 12,
+        "pageGroupOverlap": 1
+      }
+    }
+    """);
+    string? prev = Environment.GetEnvironmentVariable(AppConfigStore.ConfigPathEnvVar);
+    string? prevOverlap = Environment.GetEnvironmentVariable("MINIOCR_LLM_PAGE_GROUP_OVERLAP");
+    try
+    {
+        Environment.SetEnvironmentVariable(AppConfigStore.ConfigPathEnvVar, tmp);
+        Environment.SetEnvironmentVariable("MINIOCR_LLM_PAGE_GROUP_OVERLAP", "3");
+        var loaded = AppConfigStore.LoadOrCreate();
+        AssertTrue(loaded.Config.Llm?.ApiKey == "legacy-key", "legacy pageGroupOverlap config loads");
+        AssertEqual("12", (loaded.Config.Llm?.PagesPerRequest ?? 0).ToString(), "pagesPerRequest still read beside ignored overlap key");
+        var llm = AppConfigStore.ResolveLlm(loaded.Config);
+        AssertEqual("12", llm.PagesPerRequest.ToString(), "runtime pagesPerRequest ignores leftover overlap env");
+        AssertEqual("legacy-key", llm.ApiKey, "runtime apiKey from legacy config");
+    }
+    finally
+    {
+        Environment.SetEnvironmentVariable(AppConfigStore.ConfigPathEnvVar, prev);
+        Environment.SetEnvironmentVariable("MINIOCR_LLM_PAGE_GROUP_OVERLAP", prevOverlap);
+        try { File.Delete(tmp); } catch { /* ignore */ }
+    }
+}
+
 Console.WriteLine(failed == 0 ? "\nAll config-path checks passed." : $"\n{failed} config-path check(s) failed.");
 return failed == 0 ? 0 : 1;

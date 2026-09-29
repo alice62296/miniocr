@@ -48,10 +48,9 @@ public sealed class LlmEntityExtractor
 
         int concurrency = Math.Clamp(_config.MaxConcurrency, 1, 32);
         _logger.LogInformation(
-            "LLM NER streaming: pageCount={PageCount}, pagesPerRequest={PagesPerRequest}, pageGroupOverlap={Overlap}, maxCharsPerRequest={MaxChars}, maxConcurrency={MaxConcurrency}",
+            "LLM NER streaming: pageCount={PageCount}, pagesPerRequest={PagesPerRequest}, maxCharsPerRequest={MaxChars}, maxConcurrency={MaxConcurrency}",
             pageCount,
             _config.PagesPerRequest,
-            _config.PageGroupOverlap,
             _config.MaxCharsPerRequest,
             concurrency);
         return new LlmExtractionSession(this, pageCount, concurrency, ct);
@@ -103,8 +102,7 @@ public sealed class LlmEntityExtractor
             _buffer = new LlmPageGrouper.OrderedBuffer(
                 pageCount,
                 owner._config.PagesPerRequest,
-                owner._config.MaxCharsPerRequest,
-                owner._config.PageGroupOverlap);
+                owner._config.MaxCharsPerRequest);
         }
 
         public void Add(OcrPageResult page)
